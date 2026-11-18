@@ -4,18 +4,48 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 
 import httpx
 
-from ai_usage_monitor.models import UsageSnapshot, UsageWindow
+from ai_usage_monitor import oauth
+from ai_usage_monitor.models import ProviderKind, UsageSnapshot, UsageWindow
 from ai_usage_monitor.providers.base import ProviderError, UsageProvider
 from ai_usage_monitor.registry import AccountRegistry
 
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_SECONDS = 300.0
+
+
+def _default_should_refresh(credentials: dict[str, str]) -> bool:
+    """Proactively refresh when within 60 s of expiry (oauth contract)."""
+    return oauth.should_refresh(credentials, now_ms=int(time.time() * 1000))
+
+
+async def _default_refresh_fn(
+    http: httpx.AsyncClient, provider: ProviderKind, credentials: dict[str, str]
+) -> dict[str, str]:
+    """Refresh via the provider's oauth client; the returned dict must be
+    persisted in full (both providers rotate refresh tokens)."""
+    client_cls = (
+        oauth.ClaudeOAuthClient
+        if provider == ProviderKind.claude_personal
+        else oauth.ChatGPTOAuthClient
+    )
+    return await client_cls().refresh_tokens(http, credentials)
+
+
+def _stringify_credentials(credentials: dict) -> dict[str, str]:
+    """Storage contract: credential values are strings (expires_at is an
+    epoch-ms int from the oauth clients, stored as str)."""
+    return {
+        key: value if isinstance(value, str) else str(value)
+        for key, value in dict(credentials).items()
+        if value is not None
+    }
 
 
 class UsagePoller:
@@ -30,12 +60,16 @@ class UsagePoller:
         registry: AccountRegistry,
         provider_factory: Callable | None = None,
         interval: float = POLL_INTERVAL_SECONDS,
+        refresh_fn: Callable | None = None,
+        should_refresh: Callable | None = None,
     ) -> None:
         from ai_usage_monitor.registry import default_provider_factory
 
         self._registry = registry
         self._provider_factory = provider_factory or default_provider_factory
         self._interval = interval
+        self._refresh_fn = refresh_fn or _default_refresh_fn
+        self._should_refresh = should_refresh or _default_should_refresh
         self._snapshots: dict[str, UsageSnapshot] = {}
         self._last_good_windows: dict[str, list[UsageWindow]] = {}
 
@@ -47,6 +81,31 @@ class UsagePoller:
         config = self._registry.get_config(account_id)
         if config is None:
             raise KeyError(account_id)
+
+        # Pre-fetch proactive refresh: ONLY accounts whose credentials contain
+        # a refresh_token (obtained via our OAuth flow) are refreshed; the
+        # CLI-owned file logins carry empty credential dicts and are never
+        # touched. On refresh failure we log and proceed with the existing
+        # access token (a stale token then 401s and the provider raises
+        # ProviderError, so the last-good logic applies).
+        credentials = dict(config.credentials)
+        if "refresh_token" in credentials and self._should_refresh(credentials):
+            try:
+                refreshed = await self._refresh_fn(
+                    http, config.provider, credentials
+                )
+            except Exception as exc:
+                logger.warning(
+                    "token refresh failed for %s; proceeding with the existing "
+                    "access token: %s",
+                    account_id,
+                    exc,
+                )
+            else:
+                credentials = _stringify_credentials(refreshed)
+                self._registry.update_credentials(account_id, credentials)
+            if credentials != config.credentials:
+                config = config.model_copy(update={"credentials": credentials})
 
         try:
             provider: UsageProvider = self._provider_factory(config)

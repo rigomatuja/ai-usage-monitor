@@ -135,6 +135,25 @@ class AccountRegistry:
             raise KeyError(account_id)
         self._save_manual(remaining)
 
+    def update_credentials(self, account_id: str, credentials: dict[str, str]) -> None:
+        """Replace the stored credentials of a manual account and persist
+        (0600, same rules as ``_save_manual``).
+
+        Raises KeyError for unknown ids and for the auto-detected accounts:
+        their credentials are the CLI-owned login files and are never
+        written by the registry."""
+        if self.is_auto(account_id):
+            raise KeyError(account_id)
+        accounts = self._load_manual()
+        for index, account in enumerate(accounts):
+            if account.id == account_id:
+                accounts[index] = account.model_copy(
+                    update={"credentials": dict(credentials)}
+                )
+                self._save_manual(accounts)
+                return
+        raise KeyError(account_id)
+
     def iter_configs(self) -> list[AccountConfig]:
         """All current accounts: auto-detected first, then manual."""
         return self._auto_configs() + self._load_manual()

@@ -13,7 +13,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from ai_usage_monitor.api import build_router
+from ai_usage_monitor.models import ProviderKind
+
+from ai_usage_monitor.api import build_oauth_router, build_router
+from ai_usage_monitor.oauth import ChatGPTOAuthClient, ClaudeOAuthClient
 from ai_usage_monitor.poller import POLL_INTERVAL_SECONDS, UsagePoller
 from ai_usage_monitor.registry import AccountRegistry
 
@@ -26,6 +29,10 @@ def create_app(
     provider_factory: Callable | None = None,
     interval: float = POLL_INTERVAL_SECONDS,
     start_background: bool = True,
+    oauth_clients: dict | None = None,
+    oauth_callback_port: int = 1455,
+    oauth_listener_factory: Callable | None = None,
+    app_port: int = 61524,
 ) -> FastAPI:
     registry = registry or AccountRegistry()
     if poller is None:
@@ -46,6 +53,11 @@ def create_app(
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+            listener_task = getattr(app.state, "oauth_listener_task", None)
+            if listener_task is not None:
+                listener_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await listener_task
 
     app = FastAPI(title="AI Usage Monitor", lifespan=lifespan)
 
@@ -63,7 +75,22 @@ def create_app(
 
     app.state.registry = registry
     app.state.poller = poller
+    # OAuth clients (injectable fakes) and pending-session state live on
+    # app.state; the Claude client needs the app port for its redirect_uri,
+    # the ChatGPT client the fixed callback port (1455 by default).
+    if oauth_clients is None:
+        oauth_clients = {
+            ProviderKind.claude_personal.value: ClaudeOAuthClient(port=app_port),
+            ProviderKind.chatgpt_personal.value: ChatGPTOAuthClient(
+                port=oauth_callback_port
+            ),
+        }
+    app.state.oauth_clients = oauth_clients
+    app.state.oauth_pending = {}
+    app.state.oauth_callback_port = oauth_callback_port
+    app.state.app_origin = f"http://127.0.0.1:{app_port}"
     app.include_router(build_router(registry, poller))
+    app.include_router(build_oauth_router(listener_factory=oauth_listener_factory))
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     @app.get("/", include_in_schema=False)
