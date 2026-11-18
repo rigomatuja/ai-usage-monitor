@@ -2,7 +2,7 @@
 
 Python app that shows current AI usage for Claude and ChatGPT/OpenAI accounts, in a local
 web UI. v1 covers the platform-independent core; the OS desktop widget is a later version.
-Status: in progress.
+Status: done (feature branch feature/v1-web-monitor; merge is the user's decision).
 
 ## Specs
 
@@ -15,13 +15,13 @@ Status: in progress.
 
 ## Tasks
 
-- T1 (S1,S4): Scaffold: git branch, pyproject, package layout, shared models, provider base contract. Route: inline. Commit: —
-- T2 (S2,S3,S5,S6): Claude personal provider (oauth/usage endpoint). Route: worker A. Commit: —
-- T3 (S2,S3,S5,S6): ChatGPT personal provider (wham/usage endpoint). Route: worker A. Commit: —
-- T4 (S5): Organization providers: Anthropic usage_report/messages; OpenAI usage/completions + costs. Route: worker B. Commit: —
-- T5 (S3,S6): Account registry (auto-detect + manual config), poller with cache, REST API, app wiring. Route: inline (parent). Commit: —
-- T6 (S4): Web dashboard: single page, card per account, per-window progress bars, add-account form. Route: worker C. Commit: —
-- T7 (S1-S6): Full test suite green, README, end-to-end verification with real local logins, work-unit commits. Route: inline (parent). Commit: —
+- T1 (S1,S4): Scaffold: git branch, pyproject, package layout, shared models, provider base contract. Route: inline. Commit: 686eacf
+- T2 (S2,S3,S5,S6): Claude personal provider (oauth/usage endpoint). Route: worker A. Commit: bdb4b28
+- T3 (S2,S3,S5,S6): ChatGPT personal provider (wham/usage endpoint). Route: worker A. Commit: bdb4b28
+- T4 (S5): Organization providers: Anthropic usage_report/messages; OpenAI usage/completions + costs. Route: worker B. Commit: f7c39e7
+- T5 (S3,S6): Account registry (auto-detect + manual config), poller with cache, REST API, app wiring. Route: inline (parent). Commit: 6a54207
+- T6 (S4): Web dashboard: single page, card per account, per-window progress bars, add-account form. Route: worker C. Commit: e98bf35
+- T7 (S1-S6): Full test suite green, README, end-to-end verification with real local logins, work-unit commits. Route: inline (parent). Commit: e98bf35 (suite 118 passed; e2e: Claude weekly 8%, ChatGPT weekly 22% Pro plan; dashboard 200)
 
 ## Architecture (frozen contract for parallel work)
 
@@ -146,3 +146,7 @@ same as Anthropic org: daily window for 24h + 7d total (detail includes dollars 
 - L2 (decision): user chose "Ambas desde la v1" — both personal subscriptions and org/team admin API accounts in v1 (S5).
 - L3 (decision): user chose "Ambos mecanismos" — auto-detected local logins plus manually configured accounts (S6).
 - L4 (research): endpoints verified against solvr.dev provider survey and usageowl PROVIDERS.md (2026-09/07); Anthropic + OpenAI Admin API docs. Key rules: never refresh tokens; percent is 0–100; ChatGPT windows identified by limit_window_seconds; credits are not dollars; poll interval >= 300s; keep last good value on error.
+- L5 (environment): system Python 3.14 externally managed, no pip/venv/uv; solved with `python3 -m venv --without-pip` + get-pip.py inside the venv (documented in README).
+- L6 (evidence): e2e run 2026-11-18 with real local logins: GET /api/accounts lists both auto accounts; GET /api/usage returns Claude weekly 8% (+ scoped weekly 0%) and ChatGPT weekly 22% "Pro plan"; dashboard serves 200. Full suite: 118 passed. Tests mock all HTTP and never read real login files.
+- L7 (defects found and fixed during integration): create_app ignored an externally supplied poller (tests triggered real provider calls); api.py closed-client AttributeError via request.app.state.http; test fixtures leaked real home logins (both paths now explicit per fixture).
+- L8 (slice note): feature branch holds 5 work-unit commits (~3950 authored lines, fresh project); slice boundary recorded here per delivery guidance. Merge/push left to the user.
