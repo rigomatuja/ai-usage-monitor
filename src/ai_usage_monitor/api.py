@@ -7,6 +7,7 @@ import contextlib
 import logging
 import secrets
 from collections.abc import Awaitable, Callable
+from time import monotonic
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
@@ -65,9 +66,23 @@ def _credential_dict(exchanged: dict) -> dict[str, str]:
     }
 
 
+class _ListenerDeadline:
+    def __init__(self, timeout: float, clock: Callable[[], float]) -> None:
+        self._timeout = timeout
+        self._clock = clock
+        self.extend()
+
+    def extend(self) -> None:
+        self._expires_at = self._clock() + self._timeout
+
+    def remaining(self) -> float:
+        return self._expires_at - self._clock()
+
+
 async def _start_chatgpt_listener(
     port: int,
     complete: Callable[[str | None, str | None], Awaitable[str]],
+    deadline: _ListenerDeadline,
 ) -> asyncio.Task:
     """Temporary loopback-only callback listener for the ChatGPT OAuth flow
     (redirect_uri host is a FIXED port in the client allow-list).
@@ -130,8 +145,15 @@ async def _start_chatgpt_listener(
 
     async def serve() -> None:
         async with server:
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(done.wait(), CHATGPT_LISTENER_TIMEOUT_SECONDS)
+            while not done.is_set():
+                remaining = deadline.remaining()
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(done.wait(), remaining)
+                except TimeoutError:
+                    # A new login may have extended the deadline during this wait.
+                    continue
 
     return asyncio.create_task(serve(), name="oauth-chatgpt-callback-listener")
 
@@ -216,7 +238,6 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
     OAuth clients and pending-session state live on ``app.state`` so tests
     can inject fakes."""
     router = APIRouter()
-    start_listener = listener_factory or _start_chatgpt_listener
 
     def _oauth_clients(app: FastAPI) -> dict:
         clients = getattr(app.state, "oauth_clients", None)
@@ -266,11 +287,11 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
                     logger.warning("ChatGPT OAuth code exchange failed", exc_info=True)
                     raise OAuthCallbackError("token exchange failed") from exc
                 credentials = _credential_dict(exchanged)
-                credentials["oauth_provider"] = _CHATGPT
                 account = app.state.registry.add_account(
                     ProviderKind.chatgpt_personal,
                     credentials.get("email") or "ChatGPT OAuth",
                     credentials,
+                    origin="oauth",
                 )
                 try:  # poll once; non-fatal
                     await app.state.poller.poll_account(account.id, http)
@@ -293,24 +314,35 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
         verifier = secrets.token_urlsafe(32)
         state = secrets.token_urlsafe(32)
         authorize_url = client.build_authorize_url(verifier, state)
-        task = getattr(app.state, "oauth_listener_task", None)
-        if provider == _CHATGPT and (task is None or task.done()):
-            try:
-                task = await start_listener(
-                    app.state.oauth_callback_port, _chatgpt_completion(app)
-                )
-            except OSError as exc:
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        "could not start the local callback listener on port "
-                        f"{app.state.oauth_callback_port}; it may already be in use"
-                    ),
-                ) from exc
-            if task is not None:
-                app.state.oauth_listener_task = task
-                task.add_done_callback(lambda t: app.state.oauth_pending.pop(_CHATGPT, None)
-                                       if t is app.state.oauth_listener_task else None)
+        if provider == _CHATGPT:
+            task = getattr(app.state, "oauth_listener_task", None)
+            if task is None or task.done():
+                deadline = _ListenerDeadline(CHATGPT_LISTENER_TIMEOUT_SECONDS, monotonic)
+                port = app.state.oauth_callback_port
+                complete = _chatgpt_completion(app)
+                try:
+                    if listener_factory is None:
+                        task = await _start_chatgpt_listener(port, complete, deadline)
+                    else:
+                        task = await listener_factory(port, complete)
+                except OSError as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "could not start the local callback listener on port "
+                            f"{port}; it may already be in use"
+                        ),
+                    ) from exc
+                if task is not None:
+                    app.state.oauth_listener_task = task
+                    app.state.oauth_listener_deadline = deadline
+                    task.add_done_callback(
+                        lambda t: app.state.oauth_pending.pop(_CHATGPT, None)
+                        if t is app.state.oauth_listener_task else None
+                    )
+            else:
+                deadline = app.state.oauth_listener_deadline
+            deadline.extend()
         # ONE pending login session per provider; a new call replaces it.
         app.state.oauth_pending[provider] = {"verifier": verifier, "state": state}
         return {"authorize_url": authorize_url}
@@ -346,11 +378,11 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
                     "Token exchange failed. Please start the sign-in again."
                 )
             credentials = _credential_dict(exchanged)
-            credentials["oauth_provider"] = _CLAUDE
             account = app.state.registry.add_account(
                 ProviderKind.claude_personal,
                 credentials.get("email") or "Claude OAuth",
                 credentials,
+                origin="oauth",
             )
             try:  # poll once; non-fatal
                 await app.state.poller.poll_account(account.id, http)

@@ -57,12 +57,13 @@ class AccountInfo(BaseModel):
 
 
 class AccountConfig(BaseModel):
-    """Persisted configuration for a manually added account."""
+    """Configuration for an account, including how it was added."""
 
     id: str
     provider: ProviderKind
     label: str
     credentials: dict[str, str]
+    origin: Literal["manual", "oauth"] = "manual"
 
 
 PROVIDER_PLATFORMS: dict[ProviderKind, Literal["claude", "openai"]] = {

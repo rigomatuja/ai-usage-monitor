@@ -11,6 +11,7 @@ import json
 import os
 import uuid
 from pathlib import Path
+from typing import Literal
 
 from platformdirs import user_config_dir
 
@@ -107,14 +108,20 @@ class AccountRegistry:
     # -- public API ---------------------------------------------------------
 
     def add_account(
-        self, provider: ProviderKind, label: str, credentials: dict[str, str]
+        self,
+        provider: ProviderKind,
+        label: str,
+        credentials: dict[str, str],
+        *,
+        origin: Literal["manual", "oauth"] = "manual",
     ) -> AccountConfig:
-        """Persist a new manual account."""
+        """Persist a new account added manually or through OAuth."""
         account = AccountConfig(
             id=f"{provider.value}-{uuid.uuid4().hex[:8]}",
             provider=provider,
             label=label.strip() or provider.value,
             credentials=credentials,
+            origin=origin,
         )
         accounts = self._load_manual()
         accounts.append(account)

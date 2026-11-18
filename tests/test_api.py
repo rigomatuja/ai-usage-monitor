@@ -83,6 +83,18 @@ class TestAccountsEndpoints:
         assert any(u["account_id"] == body["id"] and u["status"] == "ok"
                    for u in usage)
 
+    def test_add_account_ignores_client_supplied_origin(self, client):
+        response = client.post(
+            "/api/accounts",
+            json={"provider": "claude_personal", "label": "Manual", "origin": "oauth"},
+        )
+
+        assert response.status_code == 201
+        account = client.app.state.registry.get_config(response.json()["id"])
+        assert account.origin == "manual"
+        assert response.json()["source"] == "manual"
+        assert "origin" not in response.json()
+
     def test_add_account_unknown_provider_is_422(self, client):
         response = client.post(
             "/api/accounts",
@@ -235,6 +247,20 @@ def _login_chatgpt(env):
     return env.listener_handlers[-1][1]
 
 
+def test_listener_deadline_extend_resets_full_timeout():
+    from ai_usage_monitor.api import _ListenerDeadline
+
+    now = 100
+    deadline = _ListenerDeadline(timeout=600, clock=lambda: now)
+    assert deadline.remaining() == 600
+    now += 599
+    assert deadline.remaining() == 1
+    deadline.extend()
+    assert deadline.remaining() == 600
+    now += 600
+    assert deadline.remaining() == 0
+
+
 class TestOAuthLogin:
     def test_claude_login_returns_authorize_url(self, oauth_env):
         response = oauth_env.client.post("/api/oauth/claude_personal/login")
@@ -278,6 +304,22 @@ class TestOAuthLogin:
             assert response.json() == {"authorize_url": f"https://auth.example.com/authorize?state={state}"}
         assert len(oauth_env.listener_handlers) == 1
         assert oauth_env.app.state.oauth_pending["chatgpt_personal"] == {"verifier": verifier, "state": state}
+
+    def test_chatgpt_relogin_extends_live_listener_deadline(self, oauth_env, monkeypatch):
+        from ai_usage_monitor import api
+
+        now = 100
+        monkeypatch.setattr(api, "monotonic", lambda: now, raising=False)
+        _login_chatgpt(oauth_env)
+        deadline = oauth_env.app.state.oauth_listener_deadline
+        now += api.CHATGPT_LISTENER_TIMEOUT_SECONDS - 1
+        assert deadline.remaining() == 1
+
+        _login_chatgpt(oauth_env)
+
+        assert len(oauth_env.listener_handlers) == 1
+        assert oauth_env.app.state.oauth_listener_deadline is deadline
+        assert deadline.remaining() == api.CHATGPT_LISTENER_TIMEOUT_SECONDS
 
     def test_unknown_provider_is_404(self, oauth_env):
         for provider in ("anthropic_org", "openai_org", "nope"):
@@ -346,8 +388,8 @@ class TestClaudeCallback:
             "refresh_token": "sk-ant-ort01-t",
             "expires_at": "1893456000000",
             "email": "user@example.com",
-            "oauth_provider": "claude_personal",
         }
+        assert config.origin == "oauth"
         # The new account was polled immediately.
         usage = oauth_env.client.get("/api/usage").json()
         assert any(
@@ -426,7 +468,8 @@ class TestChatGPTCompletion:
         assert config.credentials["account_id"] == "acct-123"
         assert config.credentials["access_token"] == "chatgpt-token"
         assert config.credentials["expires_at"] == "1893456000000"
-        assert config.credentials["oauth_provider"] == "chatgpt_personal"
+        assert "oauth_provider" not in config.credentials
+        assert config.origin == "oauth"
         usage = oauth_env.client.get("/api/usage").json()
         assert any(
             u["account_id"] == infos[0].id and u["status"] == "ok" for u in usage

@@ -91,7 +91,6 @@ class UsagePoller:
             logger.warning("token refresh failed for %s: %s", account_id, exc)
             return None
         rotated = _stringify_credentials(refreshed)
-        rotated["oauth_provider"] = provider.value
         self._persist(account_id, rotated)
         return rotated
 
@@ -112,13 +111,16 @@ class UsagePoller:
 
         kind = config.provider
         refreshable = (
-            kind in (ProviderKind.claude_personal, ProviderKind.chatgpt_personal)
-            and credentials.get("oauth_provider") == kind.value
+            config.origin == "oauth"
+            and kind in (ProviderKind.claude_personal, ProviderKind.chatgpt_personal)
             and "refresh_token" in credentials
         )
-        attempted_refresh = refreshable and self._should_refresh(credentials)
-        if attempted_refresh:
-            credentials = await self._refresh(account_id, kind, credentials, http) or credentials
+        proactive_refresh_succeeded = False
+        if refreshable and self._should_refresh(credentials):
+            rotated = await self._refresh(account_id, kind, credentials, http)
+            if rotated is not None:
+                credentials = rotated
+                proactive_refresh_succeeded = True
         if credentials != config.credentials:
             config = config.model_copy(update={"credentials": credentials})
 
@@ -127,7 +129,11 @@ class UsagePoller:
             try:
                 windows = await provider.fetch(http)
             except ProviderError as exc:
-                if getattr(exc, "status_code", None) != 401 or not refreshable or attempted_refresh:
+                if (
+                    getattr(exc, "status_code", None) != 401
+                    or not refreshable
+                    or proactive_refresh_succeeded
+                ):
                     raise
                 rotated = await self._refresh(account_id, kind, credentials, http)
                 if rotated is None:
