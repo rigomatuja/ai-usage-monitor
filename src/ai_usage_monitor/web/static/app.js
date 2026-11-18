@@ -12,6 +12,7 @@
 const POLL_INTERVAL_MS = 60 * 1000; // server caches and polls providers at >= 300 s
 
 let accounts = [];
+let oauthStartCount = null;
 let connectionLost = false;
 
 const $ = (id) => document.getElementById(id);
@@ -227,9 +228,9 @@ let lastUsage = [];
 
 async function loadAccounts() {
   accounts = await getJson("/api/accounts");
-  // Any successful accounts fetch means a pending OAuth login is either done
-  // (the callback stored the account) or moot — clear the waiting status.
-  els.oauthWaiting.classList.add("hidden");
+  if (oauthStartCount !== null && accounts.length > oauthStartCount) {
+    clearOauthStatus();
+  }
 }
 
 async function loadUsage() {
@@ -329,12 +330,13 @@ const OAUTH_LOGIN_PATHS = {
 };
 
 function clearOauthStatus() {
+  oauthStartCount = null;
   els.oauthWaiting.classList.add("hidden");
   els.oauthError.classList.add("hidden");
 }
 
 function showOauthError(message) {
-  els.oauthWaiting.classList.add("hidden");
+  clearOauthStatus();
   els.oauthError.textContent = message; // server error message, shown inline
   els.oauthError.classList.remove("hidden");
 }
@@ -342,6 +344,7 @@ function showOauthError(message) {
 async function startOauthLogin(providerKey) {
   const tab = window.open("", "_blank");
   clearOauthStatus(); // clicking again resets any previous status
+  oauthStartCount = accounts.length;
   let res;
   let body = null;
   try {

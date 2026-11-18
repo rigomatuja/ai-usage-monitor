@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import Callable
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from ai_usage_monitor.poller import POLL_INTERVAL_SECONDS, UsagePoller
 from ai_usage_monitor.registry import AccountRegistry
 
 STATIC_DIR = Path(__file__).parent / "web" / "static"
+logger = logging.getLogger(__name__)
 
 
 def create_app(
@@ -41,7 +43,7 @@ def create_app(
         )
 
     @contextlib.asynccontextmanager
-    async def lifespan(app: FastAPI):
+    async def background(app: FastAPI):
         if not start_background:
             yield
             return
@@ -58,6 +60,16 @@ def create_app(
                 listener_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await listener_task
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app: FastAPI):
+        try:
+            async with background(app):
+                yield
+        finally:
+            unsaved = poller.flush_unpersisted()
+            if unsaved:
+                logger.error("Rotated credentials unsaved at shutdown for %s", ", ".join(unsaved))
 
     app = FastAPI(title="AI Usage Monitor", lifespan=lifespan)
 

@@ -176,12 +176,22 @@ def test_app_js_posts_oauth_login(app_js: str):
 
 def test_app_js_shows_waiting_status_and_clears_it(app_js: str):
     assert "Waiting for login to complete" in app_js
-    # the waiting line is tied to both sign-in buttons and cleared via the
-    # accounts re-fetch path (any successful /api/accounts fetch clears it)
+    # The waiting line is tied to both sign-in buttons.
     assert "signin-claude" in app_js
     assert "signin-chatgpt" in app_js
     assert "oauth-waiting" in app_js
     assert "oauth-error" in app_js
+
+
+def test_account_reload_only_clears_oauth_when_count_grows(app_js: str):
+    load = app_js.split("async function loadAccounts() {", 1)[1].split("\n}", 1)[0]
+    start = app_js.split("async function startOauthLogin(providerKey) {", 1)[1].split("\n}", 1)[0]
+    assert re.fullmatch(
+        r'\s*accounts = await getJson\("/api/accounts"\);\s*'
+        r'if \(oauthStartCount !== null && accounts.length > oauthStartCount\) \{\s*'
+        r'clearOauthStatus\(\);\s*\}\s*', load
+    )
+    assert start.index("oauthStartCount = accounts.length;") < start.index("await fetchJson(")
 
 
 # --- styles.css: progress-bar classes ---------------------------------------

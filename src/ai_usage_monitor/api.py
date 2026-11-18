@@ -38,6 +38,10 @@ class OAuthCallbackError(Exception):
     token values; the ChatGPT listener turns this into an HTML 400 page."""
 
 
+class _UnconsumedOAuthCallbackError(OAuthCallbackError):
+    """The callback was rejected before consuming a sign-in session."""
+
+
 _CALLBACK_ERROR_HTML = (
     "<!doctype html><html><head><meta charset=\"utf-8\">"
     "<title>Sign-in failed</title></head><body>"
@@ -83,19 +87,21 @@ async def _start_chatgpt_listener(
     port: int,
     complete: Callable[[str | None, str | None], Awaitable[str]],
     deadline: _ListenerDeadline,
+    has_pending: Callable[[], bool],
 ) -> asyncio.Task:
     """Temporary loopback-only callback listener for the ChatGPT OAuth flow
     (redirect_uri host is a FIXED port in the client allow-list).
 
-    Binds 127.0.0.1:<port>, serves a single GET /auth/callback, runs the
-    completion callback and redirects the browser to the app origin, then
-    shuts down. Returns the serving task right after binding succeeds so the
+    Binds 127.0.0.1:<port> and serves GET /auth/callback until a callback
+    consumes the pending session or the deadline expires.
+    Returns the serving task right after binding succeeds so the
     login request does not block; raises OSError when the port is taken."""
     done = asyncio.Event()
 
     async def handle(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        session_consumed = False
         try:
             request_line = (await reader.readline()).decode("latin-1")
             while True:  # drain headers
@@ -117,9 +123,11 @@ async def _start_chatgpt_listener(
             state = (params.get("state") or [None])[0]
             try:
                 location = await complete(code, state)
+                session_consumed = True
                 head = f"HTTP/1.1 302 Found\r\nLocation: {location}\r\n"
                 payload = b""
-            except Exception:
+            except Exception as exc:
+                session_consumed = not isinstance(exc, _UnconsumedOAuthCallbackError)
                 # Never a stack trace, never token values.
                 logger.warning("ChatGPT OAuth callback failed", exc_info=True)
                 payload = _CALLBACK_ERROR_HTML.format(
@@ -134,18 +142,22 @@ async def _start_chatgpt_listener(
                 "\r\nConnection: close\r\n\r\n".encode("latin-1") + payload
             )
             await writer.drain()
-            done.set()
         except Exception:
             logger.warning("ChatGPT callback listener I/O error", exc_info=True)
-            done.set()
         finally:
             writer.close()
+            if session_consumed:
+                done.set()
 
     server = await asyncio.start_server(handle, "127.0.0.1", port)
 
     async def serve() -> None:
         async with server:
-            while not done.is_set():
+            while True:
+                if done.is_set():
+                    if not has_pending():
+                        break
+                    done.clear()
                 remaining = deadline.remaining()
                 if remaining <= 0:
                     break
@@ -267,7 +279,7 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
         async def complete(code: str | None, state: str | None) -> str:
             pending = app.state.oauth_pending.get(_CHATGPT)
             if pending is None:
-                raise OAuthCallbackError("no pending sign-in session")
+                raise _UnconsumedOAuthCallbackError("no pending sign-in session")
             if (
                 not code
                 or not state
@@ -275,7 +287,7 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
                     state.encode(), pending["state"].encode()
                 )
             ):
-                raise OAuthCallbackError("invalid state parameter")
+                raise _UnconsumedOAuthCallbackError("invalid state parameter")
             app.state.oauth_pending.pop(_CHATGPT, None)
             client = _oauth_clients(app)[_CHATGPT]
             async with _http_for(app) as http:
@@ -322,7 +334,9 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
                 complete = _chatgpt_completion(app)
                 try:
                     if listener_factory is None:
-                        task = await _start_chatgpt_listener(port, complete, deadline)
+                        task = await _start_chatgpt_listener(
+                            port, complete, deadline, lambda: _CHATGPT in app.state.oauth_pending
+                        )
                     else:
                         task = await listener_factory(port, complete)
                 except OSError as exc:

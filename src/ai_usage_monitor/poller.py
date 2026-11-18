@@ -74,6 +74,7 @@ class UsagePoller:
         self._snapshots: dict[str, UsageSnapshot] = {}
         self._last_good_windows: dict[str, list[UsageWindow]] = {}
         self._unpersisted: dict[str, dict[str, str]] = {}
+        self._poll_locks: dict[str, asyncio.Lock] = {}
 
     def _persist(self, account_id: str, credentials: dict[str, str]) -> None:
         try:
@@ -83,6 +84,12 @@ class UsagePoller:
             self._unpersisted[account_id] = credentials
         else:
             self._unpersisted.pop(account_id, None)
+
+    def flush_unpersisted(self) -> list[str]:
+        """Retry each pending credential write and report unsaved account IDs."""
+        for account_id, credentials in list(self._unpersisted.items()):
+            self._persist(account_id, credentials)
+        return list(self._unpersisted)
 
     async def _refresh(self, account_id, provider, credentials, http) -> dict[str, str] | None:
         try:
@@ -99,6 +106,13 @@ class UsagePoller:
     ) -> UsageSnapshot:
         """Poll one account and store its snapshot. Raises KeyError if the
         account does not exist."""
+        lock = self._poll_locks.get(account_id)
+        if lock is None:
+            lock = self._poll_locks[account_id] = asyncio.Lock()
+        async with lock:
+            return await self._poll_account(account_id, http)
+
+    async def _poll_account(self, account_id: str, http: httpx.AsyncClient) -> UsageSnapshot:
         config = self._registry.get_config(account_id)
         if config is None:
             raise KeyError(account_id)
@@ -193,4 +207,5 @@ class UsagePoller:
         """Poll all accounts forever, once per interval."""
         while True:
             await asyncio.sleep(self._interval)
+            self.flush_unpersisted()
             await self.poll_all(http)

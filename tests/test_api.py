@@ -446,6 +446,67 @@ class TestClaudeCallback:
         assert len(oauth_env.registry.list_infos()) == 0
 
 
+@pytest.mark.parametrize("fail_exchange", [False, True])
+async def test_chatgpt_listener_accepts_replacement_after_stale_callback(
+    oauth_env, monkeypatch, fail_exchange
+):
+    from ai_usage_monitor.app import create_app
+
+    start_server = asyncio.start_server
+
+    async def bind_ephemeral(*args, **kwargs):
+        nonlocal port
+        server = await start_server(*args, **kwargs)
+        port = server.sockets[0].getsockname()[1]
+        return server
+
+    port = 0
+    monkeypatch.setattr(asyncio, "start_server", bind_ephemeral)
+    app = create_app(registry=oauth_env.registry, poller=oauth_env.app.state.poller,
+                     start_background=False, oauth_callback_port=0,
+                     oauth_clients={"chatgpt_personal": oauth_env.chatgpt})
+
+    async def callback(state):
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(f"GET /auth/callback?code=auth-code&state={state} HTTP/1.1\r\n\r\n".encode())
+            await writer.drain()
+            return await asyncio.wait_for(reader.read(), 2)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                 base_url="http://test") as client:
+        for _ in range(2):
+            assert (await client.post("/api/oauth/chatgpt_personal/login")).status_code == 200
+        task = app.state.oauth_listener_task
+        try:
+            (_, stale), (verifier, current) = oauth_env.chatgpt.authorize_calls
+            rejected = await callback(stale)
+            assert rejected.startswith(b"HTTP/1.1 400 Bad Request\r\n")
+            assert b"Sign-in failed. Please try signing in again." in rejected
+            assert (await client.get("/api/accounts")).json() == []
+            assert oauth_env.chatgpt.exchange_calls == []
+            assert not task.done()
+            assert app.state.oauth_pending["chatgpt_personal"]["state"] == current
+            oauth_env.chatgpt.fail_exchange = fail_exchange
+            result = await callback(current)
+            await asyncio.wait_for(asyncio.shield(task), 2)
+            assert oauth_env.chatgpt.exchange_calls == [("auth-code", verifier, current)]
+            accounts = (await client.get("/api/accounts")).json()
+            if fail_exchange:
+                assert result == rejected
+                assert accounts == []
+            else:
+                assert result == (b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:61524/\r\n"
+                                  b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+                assert [account["label"] for account in accounts] == ["gpt@example.com"]
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
 class TestChatGPTCompletion:
     """The temporary listener's completion callback mirrors the Claude
     callback: exchange, add account, poll once, redirect to the app origin."""

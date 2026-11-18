@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import DEFAULT, AsyncMock, Mock
 
 import httpx
 import pytest
@@ -191,6 +192,44 @@ class TestPrefetchRefresh:
             "refresh_token": "new-rt",
             "expires_at": "1893456000000",
         }
+
+    @pytest.mark.parametrize("persist_fails", [False, True])
+    async def test_overlapping_polls_refresh_once(self, setup, http, monkeypatch, persist_fails):
+        registry, _ = setup
+        account = self._add_oauth_account(registry)
+        if persist_fails:
+            monkeypatch.setattr(registry, "update_credentials", Mock(side_effect=OSError("disk")))
+
+        async def rotate(*args):
+            await asyncio.sleep(0.01)
+            return self.ROTATED
+
+        refresh = AsyncMock(side_effect=rotate)
+        poller = UsagePoller(registry, lambda c: FakeProvider(c.credentials), refresh_fn=refresh,
+                             should_refresh=lambda c: c["access_token"] == "old-at")
+        snapshots = await asyncio.gather(*(poller.poll_account(account.id, http) for _ in range(2)))
+        refresh.assert_awaited_once_with(http, ProviderKind.claude_personal, self.OLD_CREDENTIALS)
+        assert [snapshot.status for snapshot in snapshots] == ["ok", "ok"]
+
+    @pytest.mark.parametrize("persist_fails", [False, True])
+    async def test_flush_unpersisted_retries_without_refresh(self, setup, http, monkeypatch, persist_fails):
+        registry, _ = setup
+        account = self._add_oauth_account(registry)
+        refresh = AsyncMock(return_value=self.ROTATED)
+        persist = Mock(wraps=registry.update_credentials,
+                       side_effect=[OSError("disk"), OSError("disk") if persist_fails else DEFAULT])
+        monkeypatch.setattr(registry, "update_credentials", persist)
+        poller = UsagePoller(registry, lambda c: FakeProvider(c.credentials),
+                             refresh_fn=refresh, should_refresh=lambda c: True)
+        assert (await poller.poll_account(account.id, http)).status == "ok"
+        assert registry.get_config(account.id).credentials == self.OLD_CREDENTIALS
+        assert poller.flush_unpersisted() == ([account.id] if persist_fails else [])
+        rotated = dict(self.ROTATED, expires_at="1893456000000")
+        assert registry.get_config(account.id).credentials == (self.OLD_CREDENTIALS if persist_fails else rotated)
+        if not persist_fails:
+            assert poller.flush_unpersisted() == []
+        assert persist.call_count == 2
+        refresh.assert_awaited_once_with(http, ProviderKind.claude_personal, self.OLD_CREDENTIALS)
 
     @pytest.mark.parametrize("persist_fails", [False, True], ids=["reactive_401", "persist_failure"])
     async def test_rotated_credentials(self, setup, http, monkeypatch, persist_fails):
