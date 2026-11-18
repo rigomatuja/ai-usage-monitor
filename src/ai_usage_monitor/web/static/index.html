@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Usage Monitor</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="connection-banner" class="connection-banner hidden" role="status">
+    connection lost — retrying…
+  </div>
+
+  <header class="app-header">
+    <h1>AI Usage Monitor</h1>
+    <button id="refresh-btn" type="button" title="Poll every account now">
+      Refresh
+    </button>
+  </header>
+
+  <main>
+    <section id="cards" class="cards-grid" aria-live="polite">
+      <!-- one card per account, rendered by app.js -->
+    </section>
+
+    <section class="add-account">
+      <h2>Add account</h2>
+      <form id="add-account-form">
+        <div class="form-row">
+          <label for="provider">Provider</label>
+          <select id="provider" name="provider" required>
+            <option value="claude_personal">claude_personal — Claude Pro/Max subscription</option>
+            <option value="chatgpt_personal">chatgpt_personal — ChatGPT Plus/Pro subscription</option>
+            <option value="anthropic_org">anthropic_org — Anthropic organization (admin API)</option>
+            <option value="openai_org">openai_org — OpenAI organization (admin API)</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label for="account-label">Label</label>
+          <input id="account-label" name="label" type="text" required
+                 placeholder="e.g. Work Claude">
+        </div>
+        <div class="form-row">
+          <label for="credentials">Credentials</label>
+          <textarea id="credentials" name="credentials" rows="4" required
+                    placeholder="key: value (one per line)"></textarea>
+          <small class="help-text">
+            One <code>key: value</code> pair per line. Expected keys:
+            claude_personal → <code>credentials_path</code>;
+            chatgpt_personal → <code>auth_path</code>;
+            anthropic_org / openai_org → <code>api_key</code>.
+          </small>
+        </div>
+        <div id="add-account-error" class="form-error hidden" role="alert"></div>
+        <button type="submit">Add account</button>
+      </form>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
