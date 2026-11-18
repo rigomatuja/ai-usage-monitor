@@ -29,6 +29,7 @@ _CLAUDE = ProviderKind.claude_personal.value
 _CHATGPT = ProviderKind.chatgpt_personal.value
 _OAUTH_PROVIDERS = (_CLAUDE, _CHATGPT)
 _CHATGPT_CALLBACK_PATH = "/auth/callback"
+CHATGPT_LISTENER_TIMEOUT_SECONDS = 600
 
 
 class OAuthCallbackError(Exception):
@@ -129,7 +130,8 @@ async def _start_chatgpt_listener(
 
     async def serve() -> None:
         async with server:
-            await done.wait()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(done.wait(), CHATGPT_LISTENER_TIMEOUT_SECONDS)
 
     return asyncio.create_task(serve(), name="oauth-chatgpt-callback-listener")
 
@@ -264,6 +266,7 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
                     logger.warning("ChatGPT OAuth code exchange failed", exc_info=True)
                     raise OAuthCallbackError("token exchange failed") from exc
                 credentials = _credential_dict(exchanged)
+                credentials["oauth_provider"] = _CHATGPT
                 account = app.state.registry.add_account(
                     ProviderKind.chatgpt_personal,
                     credentials.get("email") or "ChatGPT OAuth",
@@ -290,15 +293,13 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
         verifier = secrets.token_urlsafe(32)
         state = secrets.token_urlsafe(32)
         authorize_url = client.build_authorize_url(verifier, state)
-        # ONE pending login session per provider; a new call replaces it.
-        app.state.oauth_pending[provider] = {"verifier": verifier, "state": state}
-        if provider == _CHATGPT:
+        task = getattr(app.state, "oauth_listener_task", None)
+        if provider == _CHATGPT and (task is None or task.done()):
             try:
                 task = await start_listener(
                     app.state.oauth_callback_port, _chatgpt_completion(app)
                 )
             except OSError as exc:
-                app.state.oauth_pending.pop(provider, None)
                 raise HTTPException(
                     status_code=503,
                     detail=(
@@ -308,6 +309,10 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
                 ) from exc
             if task is not None:
                 app.state.oauth_listener_task = task
+                task.add_done_callback(lambda t: app.state.oauth_pending.pop(_CHATGPT, None)
+                                       if t is app.state.oauth_listener_task else None)
+        # ONE pending login session per provider; a new call replaces it.
+        app.state.oauth_pending[provider] = {"verifier": verifier, "state": state}
         return {"authorize_url": authorize_url}
 
     @router.get("/api/oauth/claude/callback", include_in_schema=False)
@@ -341,6 +346,7 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
                     "Token exchange failed. Please start the sign-in again."
                 )
             credentials = _credential_dict(exchanged)
+            credentials["oauth_provider"] = _CLAUDE
             account = app.state.registry.add_account(
                 ProviderKind.claude_personal,
                 credentials.get("email") or "Claude OAuth",

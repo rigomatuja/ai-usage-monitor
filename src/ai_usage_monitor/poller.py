@@ -30,11 +30,12 @@ async def _default_refresh_fn(
 ) -> dict[str, str]:
     """Refresh via the provider's oauth client; the returned dict must be
     persisted in full (both providers rotate refresh tokens)."""
-    client_cls = (
-        oauth.ClaudeOAuthClient
-        if provider == ProviderKind.claude_personal
-        else oauth.ChatGPTOAuthClient
-    )
+    client_cls = {
+        ProviderKind.claude_personal: oauth.ClaudeOAuthClient,
+        ProviderKind.chatgpt_personal: oauth.ChatGPTOAuthClient,
+    }.get(provider)
+    if client_cls is None:
+        raise ValueError(f"unsupported OAuth provider: {provider}")
     return await client_cls().refresh_tokens(http, credentials)
 
 
@@ -72,6 +73,27 @@ class UsagePoller:
         self._should_refresh = should_refresh or _default_should_refresh
         self._snapshots: dict[str, UsageSnapshot] = {}
         self._last_good_windows: dict[str, list[UsageWindow]] = {}
+        self._unpersisted: dict[str, dict[str, str]] = {}
+
+    def _persist(self, account_id: str, credentials: dict[str, str]) -> None:
+        try:
+            self._registry.update_credentials(account_id, credentials)
+        except Exception:
+            logger.warning("could not persist rotated credentials for %s", account_id)
+            self._unpersisted[account_id] = credentials
+        else:
+            self._unpersisted.pop(account_id, None)
+
+    async def _refresh(self, account_id, provider, credentials, http) -> dict[str, str] | None:
+        try:
+            refreshed = await self._refresh_fn(http, provider, credentials)
+        except Exception as exc:
+            logger.warning("token refresh failed for %s: %s", account_id, exc)
+            return None
+        rotated = _stringify_credentials(refreshed)
+        rotated["oauth_provider"] = provider.value
+        self._persist(account_id, rotated)
+        return rotated
 
     async def poll_account(
         self, account_id: str, http: httpx.AsyncClient
@@ -82,34 +104,36 @@ class UsagePoller:
         if config is None:
             raise KeyError(account_id)
 
-        # Pre-fetch proactive refresh: ONLY accounts whose credentials contain
-        # a refresh_token (obtained via our OAuth flow) are refreshed; the
-        # CLI-owned file logins carry empty credential dicts and are never
-        # touched. On refresh failure we log and proceed with the existing
-        # access token (a stale token then 401s and the provider raises
-        # ProviderError, so the last-good logic applies).
-        credentials = dict(config.credentials)
-        if "refresh_token" in credentials and self._should_refresh(credentials):
-            try:
-                refreshed = await self._refresh_fn(
-                    http, config.provider, credentials
-                )
-            except Exception as exc:
-                logger.warning(
-                    "token refresh failed for %s; proceeding with the existing "
-                    "access token: %s",
-                    account_id,
-                    exc,
-                )
-            else:
-                credentials = _stringify_credentials(refreshed)
-                self._registry.update_credentials(account_id, credentials)
-            if credentials != config.credentials:
-                config = config.model_copy(update={"credentials": credentials})
+        credentials = self._unpersisted.get(account_id)
+        if credentials is None:
+            credentials = dict(config.credentials)
+        else:
+            self._persist(account_id, credentials)
+
+        kind = config.provider
+        refreshable = (
+            kind in (ProviderKind.claude_personal, ProviderKind.chatgpt_personal)
+            and credentials.get("oauth_provider") == kind.value
+            and "refresh_token" in credentials
+        )
+        attempted_refresh = refreshable and self._should_refresh(credentials)
+        if attempted_refresh:
+            credentials = await self._refresh(account_id, kind, credentials, http) or credentials
+        if credentials != config.credentials:
+            config = config.model_copy(update={"credentials": credentials})
 
         try:
             provider: UsageProvider = self._provider_factory(config)
-            windows = await provider.fetch(http)
+            try:
+                windows = await provider.fetch(http)
+            except ProviderError as exc:
+                if getattr(exc, "status_code", None) != 401 or not refreshable or attempted_refresh:
+                    raise
+                rotated = await self._refresh(account_id, kind, credentials, http)
+                if rotated is None:
+                    raise
+                provider = self._provider_factory(config.model_copy(update={"credentials": rotated}))
+                windows = await provider.fetch(http)
         except ProviderError as exc:
             snapshot = UsageSnapshot(
                 account_id=account_id,

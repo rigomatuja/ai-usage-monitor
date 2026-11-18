@@ -340,6 +340,7 @@ function showOauthError(message) {
 }
 
 async function startOauthLogin(providerKey) {
+  const tab = window.open("", "_blank");
   clearOauthStatus(); // clicking again resets any previous status
   let res;
   let body = null;
@@ -347,19 +348,31 @@ async function startOauthLogin(providerKey) {
     res = await fetchJson(OAUTH_LOGIN_PATHS[providerKey], { method: "POST" });
     body = await res.json();
   } catch (err) {
+    if (tab) tab.close();
     showOauthError("connection lost");
     return;
   }
   if (!res.ok) {
+    if (tab) tab.close();
     showOauthError(serverErrorMessage(res, body));
     return;
   }
   if (!body || !body.authorize_url) {
+    if (tab) tab.close();
     showOauthError("server did not return an authorize URL");
     return;
   }
-  window.open(body.authorize_url, "_blank");
   els.oauthWaiting.textContent = "Waiting for login to complete\u2026";
+  if (tab) {
+    tab.location.href = body.authorize_url;
+  } else {
+    const link = document.createElement("a");
+    link.href = body.authorize_url;
+    link.target = "_blank";
+    link.rel = "noopener";
+    link.textContent = "Open the sign-in page";
+    els.oauthWaiting.replaceChildren(link);
+  }
   els.oauthWaiting.classList.remove("hidden");
 }
 

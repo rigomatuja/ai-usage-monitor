@@ -88,9 +88,9 @@ class ClaudePersonalProvider(UsageProvider):
         except httpx.HTTPError as exc:
             raise ProviderError(f"Claude usage request failed: {exc}") from exc
         if response.status_code >= 400:
-            raise ProviderError(
-                f"Claude usage endpoint returned HTTP {response.status_code}"
-            )
+            error = ProviderError(f"Claude usage endpoint returned HTTP {response.status_code}")
+            error.status_code = response.status_code  # lets the poller retry once on 401
+            raise error
         try:
             payload = response.json()
         except ValueError as exc:

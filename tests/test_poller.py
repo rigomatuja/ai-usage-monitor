@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -138,6 +139,7 @@ class TestPrefetchRefresh:
         "access_token": "old-at",
         "refresh_token": "old-rt",
         "expires_at": "1",
+        "oauth_provider": "claude_personal",
     }
     ROTATED = {
         "access_token": "new-at",
@@ -190,7 +192,53 @@ class TestPrefetchRefresh:
             "access_token": "new-at",
             "refresh_token": "new-rt",
             "expires_at": "1893456000000",
+            "oauth_provider": "claude_personal",
         }
+
+    @pytest.mark.parametrize("persist_fails", [False, True], ids=["reactive_401", "persist_failure"])
+    async def test_rotated_credentials(self, setup, http, monkeypatch, persist_fails):
+        registry, _ = setup
+        account = self._add_oauth_account(registry)
+        refresh = AsyncMock(return_value=self.ROTATED)
+        persist = Mock(wraps=registry.update_credentials, side_effect=OSError("disk") if persist_fails else None)
+        monkeypatch.setattr(registry, "update_credentials", persist)
+        seen = []
+
+        class Provider(FakeProvider):
+            async def fetch(self, http):
+                token = self.credentials["access_token"]
+                seen.append(token)
+                if token == "old-at":
+                    error = ProviderError("unauthorized")
+                    error.status_code = 401
+                    raise error
+                return await super().fetch(http)
+
+        poller = UsagePoller(registry, lambda c: Provider(c.credentials), refresh_fn=refresh,
+                             should_refresh=lambda c: persist_fails and c["access_token"] == "old-at")
+        assert (await poller.poll_account(account.id, http)).status == "ok"
+        if persist_fails:
+            assert registry.get_config(account.id).credentials == self.OLD_CREDENTIALS
+            persist.side_effect = None
+            assert (await poller.poll_account(account.id, http)).status == "ok"
+        refresh.assert_awaited_once_with(http, ProviderKind.claude_personal, self.OLD_CREDENTIALS)
+        assert seen == (["new-at", "new-at"] if persist_fails else ["old-at", "new-at"])
+        assert registry.get_config(account.id).credentials == dict(
+            self.ROTATED, expires_at="1893456000000", oauth_provider="claude_personal"
+        )
+
+    @pytest.mark.parametrize("provider, provenance", [(ProviderKind.claude_personal, {}),
+                                                       (ProviderKind.anthropic_org, {"oauth_provider": "claude_personal"})])
+    async def test_tokens_without_matching_oauth_provenance(self, setup, http, provider, provenance):
+        registry, _ = setup
+        credentials = {"refresh_token": "manual-rt", **provenance}
+        account = registry.add_account(provider, "Manual", credentials)
+        refresh = AsyncMock(return_value=self.ROTATED)
+        poller = UsagePoller(registry, lambda c: FakeProvider(c.credentials), refresh_fn=refresh,
+                             should_refresh=lambda c: True)
+        assert (await poller.poll_account(account.id, http)).status == "ok"
+        refresh.assert_not_called()
+        assert registry.get_config(account.id).credentials == credentials
 
     async def test_no_refresh_token_in_credentials_never_refreshed(
         self, setup, http

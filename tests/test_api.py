@@ -3,6 +3,7 @@ frontend side of the same contract)."""
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import httpx
@@ -195,7 +196,7 @@ def oauth_env(tmp_path):
 
     async def fake_listener(port, handler):
         listener_handlers.append((port, handler))
-        return None
+        return asyncio.get_running_loop().create_future()
 
     from ai_usage_monitor.app import create_app
 
@@ -269,6 +270,15 @@ class TestOAuthLogin:
         pending = oauth_env.app.state.oauth_pending["claude_personal"]
         assert pending["verifier"] == oauth_env.claude.authorize_calls[-1][0]
 
+    def test_chatgpt_relogin_reuses_listener_and_replaces_session(self, oauth_env):
+        for _ in range(2):
+            response = oauth_env.client.post("/api/oauth/chatgpt_personal/login")
+            assert response.status_code == 200
+            verifier, state = oauth_env.chatgpt.authorize_calls[-1]
+            assert response.json() == {"authorize_url": f"https://auth.example.com/authorize?state={state}"}
+        assert len(oauth_env.listener_handlers) == 1
+        assert oauth_env.app.state.oauth_pending["chatgpt_personal"] == {"verifier": verifier, "state": state}
+
     def test_unknown_provider_is_404(self, oauth_env):
         for provider in ("anthropic_org", "openai_org", "nope"):
             response = oauth_env.client.post(f"/api/oauth/{provider}/login")
@@ -298,10 +308,13 @@ class TestOAuthLogin:
             oauth_clients={"chatgpt_personal": FakeOAuthClient(CHATGPT_EXCHANGE)},
             oauth_listener_factory=busy_listener,
         )
+        pending = {"verifier": "old-verifier", "state": "old-state"}
+        app.state.oauth_pending["chatgpt_personal"] = pending
         with TestClient(app) as client:
             response = client.post("/api/oauth/chatgpt_personal/login")
         assert response.status_code == 503
-        assert "1455" in response.json()["detail"]
+        assert response.json() == {"detail": "could not start the local callback listener on port 1455; it may already be in use"}
+        assert app.state.oauth_pending["chatgpt_personal"] == pending
 
 
 class TestClaudeCallback:
@@ -333,6 +346,7 @@ class TestClaudeCallback:
             "refresh_token": "sk-ant-ort01-t",
             "expires_at": "1893456000000",
             "email": "user@example.com",
+            "oauth_provider": "claude_personal",
         }
         # The new account was polled immediately.
         usage = oauth_env.client.get("/api/usage").json()
@@ -412,6 +426,7 @@ class TestChatGPTCompletion:
         assert config.credentials["account_id"] == "acct-123"
         assert config.credentials["access_token"] == "chatgpt-token"
         assert config.credentials["expires_at"] == "1893456000000"
+        assert config.credentials["oauth_provider"] == "chatgpt_personal"
         usage = oauth_env.client.get("/api/usage").json()
         assert any(
             u["account_id"] == infos[0].id and u["status"] == "ok" for u in usage
