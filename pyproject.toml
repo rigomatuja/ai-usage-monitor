@@ -1,0 +1,33 @@
+[project]
+name = "ai-usage-monitor"
+version = "0.1.0"
+description = "Local web app monitoring Claude and ChatGPT/OpenAI usage across multiple accounts"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "platformdirs>=4.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+ai-usage-monitor = "ai_usage_monitor.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ai_usage_monitor"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
