@@ -8,8 +8,9 @@ from collections.abc import Callable
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from ai_usage_monitor.api import build_router
@@ -47,6 +48,19 @@ def create_app(
                 await task
 
     app = FastAPI(title="AI Usage Monitor", lifespan=lifespan)
+
+    @app.exception_handler(RequestValidationError)
+    async def scrub_validation_errors(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        """422 responses must not echo submitted input: request bodies may
+        contain credentials (e.g. admin API keys)."""
+        errors = [
+            {key: value for key, value in error.items() if key != "input"}
+            for error in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": errors})
+
     app.state.registry = registry
     app.state.poller = poller
     app.include_router(build_router(registry, poller))

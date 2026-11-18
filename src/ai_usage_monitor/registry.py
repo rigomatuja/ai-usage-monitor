@@ -89,10 +89,19 @@ class AccountRegistry:
 
     def _save_manual(self, accounts: list[AccountConfig]) -> None:
         self._config_dir.mkdir(parents=True, exist_ok=True)
-        payload = [account.model_dump(mode="json") for account in accounts]
-        self._accounts_file.write_text(
-            json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+        payload = json.dumps([account.model_dump(mode="json") for account in accounts], indent=2) + "\n"
+        # Create the file with 0600 from the very first write: write_text()
+        # would create it world/group-readable (umask default) until a later
+        # chmod, exposing credentials in a transient window on multi-user
+        # hosts.
+        fd = os.open(
+            self._accounts_file,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
         )
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        # Defense in depth for files created by older versions.
         os.chmod(self._accounts_file, 0o600)
 
     # -- public API ---------------------------------------------------------
