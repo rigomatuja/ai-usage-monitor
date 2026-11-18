@@ -29,10 +29,12 @@ token/cost usage, across multiple accounts per platform.
 python3 -m venv .venv
 .venv/bin/python -m pip install -e .
 .venv/bin/python -m ai_usage_monitor
-# open http://127.0.0.1:8000
+# open http://127.0.0.1:61524
 ```
 
-Options: `--host` (default 127.0.0.1), `--port` (default 8000), `--verbose`.
+Options: `--host` (default 127.0.0.1), `--port` (default 61524 — an uncommon port
+deliberately chosen so it does not clash with other local apps; change it with
+`--port` if it is ever taken), `--verbose`.
 
 > If your Python is externally managed (PEP 668) and `venv` lacks pip, run
 > `python3 /tmp/get-pip.py` inside the venv (see

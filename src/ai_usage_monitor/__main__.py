@@ -16,7 +16,12 @@ def main() -> None:
         description="Local web app monitoring Claude and ChatGPT/OpenAI usage.",
     )
     parser.add_argument("--host", default="127.0.0.1", help="Bind address")
-    parser.add_argument("--port", type=int, default=8000, help="Bind port")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=61524,
+        help="Bind port (default: 61524, chosen to avoid clashing with common local services)",
+    )
     parser.add_argument(
         "--verbose", action="store_true", help="Enable debug logging"
     )
