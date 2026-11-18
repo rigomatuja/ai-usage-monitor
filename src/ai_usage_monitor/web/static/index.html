@@ -23,6 +23,26 @@
       <!-- one card per account, rendered by app.js -->
     </section>
 
+    <section class="signin">
+      <h2>Sign in</h2>
+      <div class="oauth-buttons">
+        <button id="signin-claude" type="button" title="Add an extra Claude personal account via OAuth">
+          Sign in with Claude
+        </button>
+        <button id="signin-chatgpt" type="button" title="Add an extra ChatGPT personal account via OAuth">
+          Sign in with ChatGPT
+        </button>
+      </div>
+      <div id="oauth-waiting" class="oauth-waiting hidden" role="status">
+        Waiting for login to complete…
+      </div>
+      <div id="oauth-error" class="form-error hidden" role="alert"></div>
+      <small class="help-text">
+        Opens the provider login in a new tab. The account appears automatically
+        once the login finishes — it can be removed like any other manual account.
+      </small>
+    </section>
+
     <section class="add-account">
       <h2>Add account</h2>
       <form id="add-account-form">

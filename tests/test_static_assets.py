@@ -121,6 +121,69 @@ def test_app_js_never_renders_credentials(app_js: str):
         )
 
 
+# --- index.html: OAuth sign-in hooks (T4, S1/S2) -----------------------------
+
+
+@pytest.mark.parametrize(
+    "dom_id",
+    [
+        "signin-claude",  # "Sign in with Claude" button
+        "signin-chatgpt",  # "Sign in with ChatGPT" button
+        "oauth-waiting",  # inline "Waiting for login to complete…" status line
+        "oauth-error",  # inline server error area for the OAuth login
+    ],
+)
+def test_index_html_has_oauth_hooks(index_html: str, dom_id: str):
+    assert f'id="{dom_id}"' in index_html, f"index.html missing id={dom_id!r}"
+
+
+def test_index_html_has_oauth_button_labels(index_html: str):
+    assert "Sign in with Claude" in index_html
+    assert "Sign in with ChatGPT" in index_html
+
+
+def test_oauth_signin_section_precedes_add_account(index_html: str):
+    # The sign-in section sits directly above the manual "Add account" form.
+    assert index_html.index("signin-claude") < index_html.index("add-account-form")
+
+
+# --- app.js: OAuth REST contract (T4) ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/oauth/claude_personal/login",
+        "/api/oauth/chatgpt_personal/login",
+    ],
+)
+def test_app_js_references_oauth_login_paths(app_js: str, path: str):
+    assert path in app_js, f"app.js does not reference {path!r}"
+
+
+def test_app_js_opens_returned_authorize_url(app_js: str):
+    # The authorize_url returned by the login endpoint is opened in a new
+    # tab/window; the server owns the absolute URL, app.js never hardcodes one.
+    assert "window.open" in app_js
+    assert "authorize_url" in app_js
+
+
+def test_app_js_posts_oauth_login(app_js: str):
+    assert re.search(r"method:\s*\"POST\"", app_js), (
+        "app.js should POST to the oauth login endpoints"
+    )
+
+
+def test_app_js_shows_waiting_status_and_clears_it(app_js: str):
+    assert "Waiting for login to complete" in app_js
+    # the waiting line is tied to both sign-in buttons and cleared via the
+    # accounts re-fetch path (any successful /api/accounts fetch clears it)
+    assert "signin-claude" in app_js
+    assert "signin-chatgpt" in app_js
+    assert "oauth-waiting" in app_js
+    assert "oauth-error" in app_js
+
+
 # --- styles.css: progress-bar classes ---------------------------------------
 
 

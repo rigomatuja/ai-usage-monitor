@@ -25,6 +25,10 @@ const els = {
   label: $("account-label"),
   credentials: $("credentials"),
   formError: $("add-account-error"),
+  signinClaude: $("signin-claude"),
+  signinChatgpt: $("signin-chatgpt"),
+  oauthWaiting: $("oauth-waiting"),
+  oauthError: $("oauth-error"),
 };
 
 /* --- connection banner ----------------------------------------------------- */
@@ -223,6 +227,9 @@ let lastUsage = [];
 
 async function loadAccounts() {
   accounts = await getJson("/api/accounts");
+  // Any successful accounts fetch means a pending OAuth login is either done
+  // (the callback stored the account) or moot — clear the waiting status.
+  els.oauthWaiting.classList.add("hidden");
 }
 
 async function loadUsage() {
@@ -312,10 +319,56 @@ async function onAddSubmit(event) {
   await refreshAll();
 }
 
+/* --- OAuth sign in ------------------------------------------------------------ */
+
+// POST /api/oauth/{provider}/login -> 200 {authorize_url}; 404 unknown provider.
+// The authorize URL comes from the server; app.js never hardcodes one.
+const OAUTH_LOGIN_PATHS = {
+  claude: "/api/oauth/claude_personal/login",
+  chatgpt: "/api/oauth/chatgpt_personal/login",
+};
+
+function clearOauthStatus() {
+  els.oauthWaiting.classList.add("hidden");
+  els.oauthError.classList.add("hidden");
+}
+
+function showOauthError(message) {
+  els.oauthWaiting.classList.add("hidden");
+  els.oauthError.textContent = message; // server error message, shown inline
+  els.oauthError.classList.remove("hidden");
+}
+
+async function startOauthLogin(providerKey) {
+  clearOauthStatus(); // clicking again resets any previous status
+  let res;
+  let body = null;
+  try {
+    res = await fetchJson(OAUTH_LOGIN_PATHS[providerKey], { method: "POST" });
+    body = await res.json();
+  } catch (err) {
+    showOauthError("connection lost");
+    return;
+  }
+  if (!res.ok) {
+    showOauthError(serverErrorMessage(res, body));
+    return;
+  }
+  if (!body || !body.authorize_url) {
+    showOauthError("server did not return an authorize URL");
+    return;
+  }
+  window.open(body.authorize_url, "_blank");
+  els.oauthWaiting.textContent = "Waiting for login to complete\u2026";
+  els.oauthWaiting.classList.remove("hidden");
+}
+
 /* --- wiring ------------------------------------------------------------------ */
 
 els.refreshBtn.addEventListener("click", onRefreshClick);
 els.form.addEventListener("submit", onAddSubmit);
+els.signinClaude.addEventListener("click", () => startOauthLogin("claude"));
+els.signinChatgpt.addEventListener("click", () => startOauthLogin("chatgpt"));
 
 refreshAll().catch((err) => console.error("initial load failed:", err));
 setInterval(() => {
