@@ -227,6 +227,58 @@ async def test_auth_file_not_written(tmp_path):
     assert auth.read_text() == before
 
 
+# ---------------------------------------------------------- inline credentials
+
+
+async def test_inline_access_token_and_account_id_used_and_files_never_read():
+    """OAuth accounts carry tokens in credentials; no local auth file is touched."""
+    seen: list[httpx.Request] = []
+    http = make_http(
+        [
+            ok(
+                {
+                    "plan_type": "pro",
+                    "rate_limit": {
+                        "primary_window": {
+                            "used_percent": 44.0,
+                            "limit_window_seconds": 18000,
+                            "reset_at": None,
+                        }
+                    },
+                }
+            )
+        ],
+        seen,
+    )
+    provider = ChatGPTPersonalProvider(
+        {
+            "access_token": ACCESS_TOKEN,
+            "account_id": ACCOUNT_ID,
+            "auth_path": "/nonexistent/inline-test-path/auth.json",
+        }
+    )
+    windows = await provider.fetch(http)
+
+    assert len(seen) == 1
+    request = seen[0]
+    assert request.headers["authorization"] == f"Bearer {ACCESS_TOKEN}"
+    assert request.headers["chatgpt-account-id"] == ACCOUNT_ID
+    assert [w.used_percent for w in windows] == [44.0]
+    assert windows[0].detail == "Pro plan"
+
+
+async def test_inline_credentials_without_account_id_raises():
+    provider = ChatGPTPersonalProvider(
+        {
+            "access_token": ACCESS_TOKEN,
+            "auth_path": "/nonexistent/inline-test-path/auth.json",
+        }
+    )
+    http = make_http([ok({})], [])
+    with pytest.raises(ProviderError):
+        await provider.fetch(http)
+
+
 # -------------------------------------------------------------- error shapes
 
 

@@ -109,7 +109,18 @@ class ChatGPTPersonalProvider(UsageProvider):
         return self._parse_windows(payload)
 
     def _load_credentials(self) -> tuple[str, str]:
-        """Read the auth file. Read-only; never writes or refreshes tokens."""
+        """Inline OAuth tokens win; otherwise read the auth file.
+        Read-only; never writes or refreshes tokens."""
+        inline_token = self.credentials.get("access_token")
+        if inline_token:
+            # OAuth account (T2): tokens come from the registry, never the
+            # local CLI auth file. account_id is required for the header.
+            account_id = self.credentials.get("account_id")
+            if not account_id:
+                raise ProviderError(
+                    "ChatGPT inline credentials have no account_id"
+                )
+            return inline_token, account_id
         raw_path = self.credentials.get("auth_path") or DEFAULT_AUTH_PATH
         path = Path(raw_path).expanduser()
         try:
