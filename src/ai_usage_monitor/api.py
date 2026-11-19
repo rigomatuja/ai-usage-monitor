@@ -81,6 +81,9 @@ class _ListenerDeadline:
         self._clock = clock
         self.changed = asyncio.Event()
         self.closed = False
+        # Set by the running listener: stops accepting connections at once
+        # without closing the callback connection being served.
+        self.close_listener: Callable[[], None] | None = None
         self.extend()
 
     def extend(self) -> None:
@@ -150,6 +153,7 @@ async def _start_chatgpt_listener(
             writer.close()
 
     server = await asyncio.start_server(handle, "127.0.0.1", port)
+    deadline.close_listener = server.close
 
     async def serve() -> None:
         async with server:
@@ -283,7 +287,11 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
         if pending["provider"] == _CHATGPT and not _has_pending_chatgpt(app):
             # Close the listening socket, not the callback connection. The
             # callback can still poll the new account and send its response.
-            app.state.oauth_listener_deadline.changed.set()
+            deadline = app.state.oauth_listener_deadline
+            if deadline.close_listener is not None:
+                deadline.close_listener()
+            deadline.closed = True
+            deadline.changed.set()
 
     def _pop_pending(app: FastAPI, state: str) -> dict:
         app.state.oauth_pending_timers.pop(state).cancel()

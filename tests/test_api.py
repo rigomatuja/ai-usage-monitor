@@ -682,10 +682,13 @@ async def test_chatgpt_listener_signals_stop_before_post_login_poll_finishes(oau
 
     start_server = asyncio.start_server
     port = 0
+    listening_sockets = []
+    socket_fds_at_poll_entry = []
 
     async def bind_ephemeral(*args, **kwargs):
         nonlocal port
         server = await start_server(*args, **kwargs)
+        listening_sockets.extend(server.sockets)
         port = server.sockets[0].getsockname()[1]
         return server
 
@@ -694,6 +697,7 @@ async def test_chatgpt_listener_signals_stop_before_post_login_poll_finishes(oau
     polling, release = asyncio.Event(), asyncio.Event()
 
     async def slow_poll(*args):
+        socket_fds_at_poll_entry.extend(sock.fileno() for sock in listening_sockets)
         polling.set()
         await release.wait()
         return await original_poll(*args)
@@ -713,6 +717,10 @@ async def test_chatgpt_listener_signals_stop_before_post_login_poll_finishes(oau
             await writer.drain()
             try:
                 await asyncio.wait_for(polling.wait(), 2)
+                # The listening socket is already closed when the poll starts.
+                assert socket_fds_at_poll_entry == [-1]
+                # A new login must start a fresh listener, not reuse this one.
+                assert app.state.oauth_listener_deadline.closed
                 assert (await client.get(_attempt(login))).json() == {"status": "completed"}
                 assert (await client.get("/api/usage")).json() == []
                 assert app.state.oauth_listener_deadline.changed.is_set()
