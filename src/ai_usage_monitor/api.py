@@ -116,7 +116,8 @@ async def _start_chatgpt_listener(
                 if not line or line in (b"\r\n", b"\n"):
                     break
             parts = request_line.split()
-            parsed = urlsplit(parts[1] if len(parts) >= 2 else "/")
+            target = parts[1] if len(parts) >= 2 else "/"
+            parsed = urlsplit(target)
             if parsed.path != _CHATGPT_CALLBACK_PATH:
                 payload = b"not found"
                 writer.write(
@@ -133,6 +134,8 @@ async def _start_chatgpt_listener(
                 len(params.get("code", [])) > 1
                 or len(params.get("state", [])) > 1
                 or (code is not None and "#" in code)
+                # urlsplit drops a literal fragment before validation: reject it.
+                or "#" in target
             ):
                 # Ambiguous or malformed callback (OpenAI codes never embed a
                 # state): reject like an unknown state, so no attempt is

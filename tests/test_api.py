@@ -1344,6 +1344,7 @@ async def test_chatgpt_listener_rejects_duplicate_state_without_consuming(oauth_
     "code=auth-code&state={s}&state=",
     "code=auth-code%23{s}&state={s}",
     "code=auth-code%23&state={s}",
+    "state={s}&code=auth-code#{s}",
 ])
 async def test_chatgpt_listener_rejects_blank_duplicates_and_embedded_state(
     oauth_env, monkeypatch, query_tail,
