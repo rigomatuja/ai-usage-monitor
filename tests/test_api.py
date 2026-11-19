@@ -842,3 +842,20 @@ class TestChatGPTCompletion:
         with pytest.raises(OAuthCallbackError):
             await handler("auth-code", state)
         assert len(oauth_env.registry.list_infos()) == 0
+
+
+def test_dashboard_assets_referenced_by_index_are_served(client):
+    """Every stylesheet/script the dashboard HTML references must resolve,
+    from the page URL "/", to a served asset (regression: relative paths
+    resolved to /styles.css and /app.js, which returned 404)."""
+    import re
+    from urllib.parse import urljoin, urlparse
+
+    page = client.get("/")
+    assert page.status_code == 200
+    refs = re.findall(r'<(?:link[^>]*href|script[^>]*src)="([^"]+)"', page.text)
+    assert len(refs) >= 2  # stylesheet + script
+    for ref in refs:
+        path = urlparse(urljoin("http://testserver/", ref)).path
+        response = client.get(path)
+        assert response.status_code == 200, f"{ref} resolves to {path}: {response.status_code}"

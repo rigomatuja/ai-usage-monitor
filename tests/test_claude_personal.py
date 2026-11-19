@@ -343,3 +343,29 @@ async def test_absent_optional_fields_omitted_not_error(tmp_path):
     assert windows[0].used_percent == 3.0
     assert windows[0].resets_at is None
     assert windows[0].detail is None  # no subscriptionType in credentials file
+
+
+async def test_weekly_scoped_label_uses_scope_model_display_name(tmp_path):
+    """Real API shape (verified live 2026-11): the scoped model name lives in
+    scope.model.display_name, not in a top-level "model" key."""
+    creds = write_credentials(tmp_path, cred_payload())
+    http = make_http(
+        [
+            ok(
+                {
+                    "limits": [
+                        {"kind": "weekly_all", "percent": 11, "resets_at": None, "scope": None},
+                        {
+                            "kind": "weekly_scoped",
+                            "percent": 0,
+                            "resets_at": None,
+                            "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None},
+                        },
+                    ]
+                }
+            )
+        ],
+        [],
+    )
+    windows = await ClaudePersonalProvider(credentials_for(creds)).fetch(http)
+    assert [w.label for w in windows] == ["Weekly", "Weekly · Fable"]
