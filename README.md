@@ -8,14 +8,19 @@ token/cost usage, across multiple accounts per platform.
 
 - **Personal subscriptions**: auto-detects local logins of Claude Code
   (`~/.claude/.credentials.json`) and Codex CLI (`~/.codex/auth.json`) and
-  reads their live usage windows (5-hour session, weekly).
+  reads their live usage windows (5-hour session, weekly). Claude always shows
+  its 5-hour session window (0% "No active session" when none is running);
+  ChatGPT shows it only when the plan reports one.
 - **Organization accounts**: add Claude Team/Enterprise or OpenAI org accounts
   via an Admin API key; shows token and cost usage (24h and 7d).
 - **Multiple accounts per platform**: auto-detected logins plus any number of
   manually added accounts (e.g. a second Claude login via its own
   credentials path, or several org keys).
 - **Local web dashboard**: one card per account with colored progress bars,
-  reset times, stale-data markers, and add/remove account forms. No internet
+  reset times (weekday, date and time in your browser's time zone, plus a
+  countdown), stale-data markers, and add/remove account forms. Any account,
+  including auto-detected ones, can be renamed from its card (**Rename**);
+  clearing the name restores the default. No internet
   dependencies; the UI is fully offline.
 
 ## Requirements
@@ -54,7 +59,9 @@ logins are never refreshed or written.
 
 Notes: the ChatGPT flow uses a temporary local listener on port 1455 (fixed
 by OpenAI's app registration); if that port is busy the login returns an
-error. Claude's callback lands on the app's own port (default 61524).
+error. Claude's callback lands on the app's own port (default 61524) at
+`/callback` (the path allowed by the Claude Code client). Each callback
+arrival is logged ("... OAuth callback received") without its parameters.
 Several sign-ins can be pending at once; each completes independently, and
 pending sign-ins expire after 10 minutes. Login requests are accepted only
 from the dashboard's own origin.

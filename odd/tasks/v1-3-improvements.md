@@ -1,0 +1,32 @@
+# AI Usage Monitor — v1.3 improvements (5-hour window, naming, sign-in, reset dates)
+
+Four user-requested improvements on top of main (7be1c96): show the 5-hour window, optional
+names for monitored connections, working OAuth sign-in, and reset dates with day and time.
+Status: in progress.
+
+## Specs
+
+- S1 (verbatim): "los indicadores deben contempar la ventana de 5 horas si esta existe en la sub usada" — claude_personal always shows a "5-hour session" window: from the API when reported (limits[] kind "session" or top-level five_hour), otherwise 0% with detail "No active session" and no reset time (live evidence 2026-11-19: five_hour is null and limits[] has no session entry when no session is active; Claude Pro/Max plans always have this window). chatgpt_personal shows a 5-hour window only when the API reports one (live evidence: primary_window is weekly, secondary_window and additional_rate_limits are null for this plan).
+- S2 (verbatim): "las conexiones monitoreadas deben poder nombrarse de forma opcional" — every account (auto-detected and manual, incl. OAuth) can get an optional custom name; clearing it restores the default label. The add-account form label becomes optional (default: provider default label).
+- S3 (verbatim): "los sign in deben permitir añadir conexiones monitoreadas ademas de las detectadas localmente" — Sign in with Claude / ChatGPT must actually add new monitored accounts. Live evidence (user log 2026-11-19): login POSTs returned 200 but no callback ever reached the app. Likely causes: Claude redirect_uri path /api/oauth/claude/callback is not on Claude Code's client allow-list (registered form: http://localhost:{port}/callback); ChatGPT authorize URL lacks the originator parameter Codex CLI sends (originator=codex_cli_rs). Live confirmation requires the user to sign in.
+- S4 (verbatim): "las fechas de reset deben incluir el dia y la hora en la zona horaria del navbegador" — every reset time shows weekday, day, month, hour and minute in the browser's time zone (with the zone abbreviation), plus the relative "in Xh Ym".
+
+## Tasks
+
+- T1 (S1,S2,S3): Backend — Claude 5-hour window rule; rename API + label persistence; OAuth redirect/originator fixes; tests. Route: worker A. Commit: —
+- T2 (S2,S4): Dashboard — rename UI on every card; optional label in the add form; reset date formatting; behavioral harness tests. Route: worker B. Commit: —
+- T3 (S1-S4): Integration, full suite, README, independent verification (Risk: item 2), commits. Route: inline (parent). Commit: —
+- T4 (S3): Live sign-in confirmation by the user. Route: user. Commit: —
+
+## Frozen contract (T1/T2 boundary)
+
+- `PATCH /api/accounts/{account_id}` body `{"label": str | null}` -> 200 AccountInfo with the effective label; works for auto and manual accounts; `null`, empty or whitespace-only clears the custom name (default label restored); label max 80 chars after trimming (422 above); 404 unknown account; requires a dashboard Origin like the OAuth login (403 otherwise).
+- `POST /api/accounts` `label` becomes optional (missing/blank -> default label for the provider).
+- AccountInfo gains `default_label: str` and `custom_label: bool` (the effective `label` keeps its meaning).
+- UsageWindow unchanged; Claude no-session window: kind five_hour, label "5-hour session", used_percent 0.0, detail "No active session" (appended to subscription detail when present), resets_at null.
+
+## Log
+
+- L1 (verbatim): "vale ahora hay que hacer algunos cambios y mejoras: - los indicadores deben contempar la ventana de 5 horas si esta existe en la sub usada - las conexiones monitoreadas deben poder nombrarse de forma opcional - los sign in deben permitir añadir conexiones monitoreadas ademas de las detectadas localmente - las fechas de reset deben incluir el dia y la hora en la zona horaria del navbegador"
+- L2 (evidence): live read-only probes 2026-11-19. Claude oauth/usage: five_hour null, limits [weekly_all 11 active, weekly_scoped 0 inactive]. ChatGPT wham/usage: primary_window 604800 s (34%), secondary_window null, additional_rate_limits null. User log: POST /api/oauth/{claude,chatgpt}_personal/login 200, no callback request afterwards.
+- L3 (integration): worker A (backend) and worker B (dashboard) done; one obsolete test (tests/test_api_credential_leak.py) triggered its 422 via a missing label, now optional by S2: it now uses an unknown provider, keeping the non-echo assertion. Suite 274 passed. Live e2e on port 61599 with an isolated config dir (the user's own app held 61524 with the old code; two test login attempts were created there by mistake and expire after 10 min): Claude windows [5-hour session 0% No active session, Weekly 11%, Weekly · Fable 0%], ChatGPT [Weekly 34% Pro plan]; PATCH rename 200 with Origin / 403 without; labels.json 0600; clearing restores the default; Claude redirect_uri http://localhost:61599/callback; /callback with unknown state 400; callback-arrival log line without code/state. README updated. Live sign-in still pending (T4).
