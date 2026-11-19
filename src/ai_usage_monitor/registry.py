@@ -47,10 +47,10 @@ def _normalize_custom_label(label: str) -> str:
         label.encode("utf-8")
     except UnicodeEncodeError:
         raise InvalidAccountLabel("label must be valid UTF-8") from None
-    # Validate before trimming: tabs, newlines and other controls aren't names.
+    # Trim first: whitespace-only input (spaces, tabs, newlines) means "no name".
+    label = label.strip()
     if any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in label):
         raise InvalidAccountLabel("label must not contain control characters")
-    label = label.strip()
     if len(label) > 80:
         raise InvalidAccountLabel("label must be at most 80 characters")
     return label
@@ -120,6 +120,15 @@ class AccountRegistry:
         except (ValueError, OSError):
             return {}
 
+    def _load_labels_for_write(self) -> dict[str, str]:
+        """Labels for an operation that writes labels.json: a missing or
+        unparseable store counts as empty, but any other read error aborts so
+        a write can never silently drop names it could not read."""
+        try:
+            return self._read_labels()
+        except (FileNotFoundError, ValueError):
+            return {}
+
     def _read_labels(self) -> dict[str, str]:
         try:
             raw = json.loads(self._labels_file.read_text(encoding="utf-8"))
@@ -185,10 +194,11 @@ class AccountRegistry:
     # -- public API ---------------------------------------------------------
 
     def _stored_label_ids(self) -> set[str]:
-        """Ids present in labels.json, including orphans; empty if unreadable."""
+        """Ids present in labels.json, including orphans. A missing or
+        unparseable store has none; other read errors abort the add."""
         try:
             raw = json.loads(self._labels_file.read_text(encoding="utf-8"))
-        except (ValueError, OSError):
+        except (FileNotFoundError, ValueError):
             return set()
         return set(raw) if isinstance(raw, dict) else set()
 
@@ -231,7 +241,7 @@ class AccountRegistry:
         if account is None:
             raise KeyError(account_id)
         label = _normalize_custom_label(label or "")
-        labels = self._load_labels()
+        labels = self._load_labels_for_write()
         if label or account_id in labels:
             if label:
                 labels[account_id] = label

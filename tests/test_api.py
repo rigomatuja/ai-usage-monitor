@@ -231,8 +231,8 @@ class TestAccountsEndpoints:
     @pytest.mark.parametrize("raw_label, detail", [
         (br'"x\udfff"', "label must be valid UTF-8"),
         (br'"x\u0000"', "label must not contain control characters"),
-        (br'" \t "', "label must not contain control characters"),
-        (br'"x\u0085"', "label must not contain control characters"),
+        (br'"x\ty"', "label must not contain control characters"),
+        (br'"x\u0085y"', "label must not contain control characters"),
         (b'" ' + b'x' * 81 + b' "', "label must be at most 80 characters"),
     ])
     def test_add_account_rejects_invalid_label_without_writing(
@@ -318,7 +318,7 @@ class TestAccountsEndpoints:
     @pytest.mark.parametrize("payload, detail", [
         (br'{"label":"\ud800"}', "label must be valid UTF-8"),
         (br'{"label":"A\u0000B"}', "label must not contain control characters"),
-        (br'{"label":" \t "}', "label must not contain control characters"),
+        (br'{"label":"A\tB"}', "label must not contain control characters"),
         (br'{"label":"A\u007fB"}', "label must not contain control characters"),
         (br'{"label":"A\u0085B"}', "label must not contain control characters"),
     ])
@@ -1171,3 +1171,101 @@ def test_recreated_account_does_not_inherit_orphaned_label(
     for row in (info, persisted):
         assert row["label"] == row["default_label"] == "New account"
         assert row["custom_label"] is False
+
+
+def test_add_does_not_reuse_orphan_id_if_labels_unreadable(
+    non_raising_client, tmp_path, monkeypatch,
+):
+    import uuid
+    from pathlib import Path
+    from unittest.mock import patch
+
+    client = non_raising_client
+    body = {"provider": "openai_org"}
+    origin = {"Origin": "http://localhost:61524"}
+    first = client.post("/api/accounts", json=body)
+    old = first.json()["id"]
+    route = f"/api/accounts/{old}"
+    assert client.patch(route, headers=origin, json={"label": "Old name"}).status_code == 200
+    stores = tmp_path / "config"
+    labels = stores / "labels.json"
+    accounts = stores / "accounts.json"
+    before_labels = labels.read_bytes()
+    read = Path.read_text
+
+    def read_fault(path, *args, **kwargs):
+        if path == labels:
+            raise PermissionError("synthetic read fault")
+        return read(path, *args, **kwargs)
+
+    def manual(rows):
+        return [row for row in rows if row["source"] == "manual"]
+
+    with patch.object(Path, "read_text", read_fault):
+        assert client.delete(route).status_code == 204
+        assert manual(client.get("/api/accounts").json()) == []
+        before_accounts = accounts.read_bytes()
+        draw = uuid.uuid4
+        candidates = iter([uuid.UUID(old.rsplit("-", 1)[1] + "0" * 24)])
+        monkeypatch.setattr(uuid, "uuid4", lambda: next(candidates, None) or draw())
+        response = client.post("/api/accounts", json=body)
+
+    assert labels.read_bytes() == before_labels
+    if response.status_code == 201:
+        info = response.json()
+        assert info["id"] != old
+        assert info["label"] == info["default_label"] == "openai_org"
+        assert info["custom_label"] is False
+        assert manual(client.get("/api/accounts").json()) == [info]
+    else:
+        assert 400 <= response.status_code < 600
+        assert accounts.read_bytes() == before_accounts
+        assert manual(client.get("/api/accounts").json()) == []
+
+
+@pytest.mark.parametrize("new_label", [None, "Another name"])
+def test_rename_does_not_report_success_when_labels_unreadable(
+    non_raising_client, tmp_path, monkeypatch, new_label,
+):
+    from pathlib import Path
+
+    client = non_raising_client
+    origin = {"Origin": "http://localhost:61524"}
+    first, second = [
+        client.post("/api/accounts", json={"provider": "openai_org"}).json()["id"]
+        for _ in range(2)
+    ]
+    assert client.patch(
+        f"/api/accounts/{first}", headers=origin, json={"label": "Keep me"},
+    ).status_code == 200
+    labels = tmp_path / "config" / "labels.json"
+    accounts = labels.with_name("accounts.json")
+    before = labels.read_bytes(), accounts.read_bytes()
+    read = Path.read_text
+
+    def read_fault(path, *args, **kwargs):
+        if path == labels:
+            raise PermissionError("synthetic read fault")
+        return read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_fault)
+    target = first if new_label is None else second
+    response = client.patch(
+        f"/api/accounts/{target}", headers=origin, json={"label": new_label},
+    )
+    assert 400 <= response.status_code < 600
+    assert (labels.read_bytes(), accounts.read_bytes()) == before
+
+
+def test_tab_only_label_defaults_on_add_and_clears_on_rename(client):
+    added = client.post("/api/accounts", json={"provider": "openai_org", "label": "\t"})
+    assert added.status_code == 201
+    default = added.json()
+    assert default["label"] == default["default_label"] == "openai_org"
+    assert default["custom_label"] is False
+    route = f"/api/accounts/{default['id']}"
+    origin = {"Origin": "http://localhost:61524"}
+    assert client.patch(route, headers=origin, json={"label": "Work"}).status_code == 200
+    cleared = client.patch(route, headers=origin, json={"label": "\t"})
+    assert cleared.status_code == 200
+    assert cleared.json() == default
