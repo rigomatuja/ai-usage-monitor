@@ -86,7 +86,7 @@ class ClaudePersonalProvider(UsageProvider):
         try:
             response = await http.get(USAGE_URL, headers=headers)
         except httpx.HTTPError as exc:
-            raise ProviderError(f"Claude usage request failed: {exc}") from exc
+            raise ProviderError(f"Claude usage request failed: {type(exc).__name__}") from None
         if response.status_code >= 400:
             error = ProviderError(f"Claude usage endpoint returned HTTP {response.status_code}")
             error.status_code = response.status_code  # lets the poller retry once on 401

@@ -106,7 +106,6 @@ async def _start_chatgpt_listener(
     async def handle(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        session_consumed = False
         try:
             request_line = (await reader.readline()).decode("latin-1")
             while True:  # drain headers
@@ -128,11 +127,9 @@ async def _start_chatgpt_listener(
             state = (params.get("state") or [None])[0]
             try:
                 location = await complete(code, state)
-                session_consumed = True
                 head = f"HTTP/1.1 302 Found\r\nLocation: {location}\r\n"
                 payload = b""
-            except Exception as exc:
-                session_consumed = not isinstance(exc, _UnconsumedOAuthCallbackError)
+            except Exception:
                 # Never a stack trace, never token values.
                 logger.warning("ChatGPT OAuth callback failed")
                 payload = _CALLBACK_ERROR_HTML.format(
@@ -151,8 +148,6 @@ async def _start_chatgpt_listener(
             logger.warning("ChatGPT callback listener I/O error", exc_info=True)
         finally:
             writer.close()
-            if session_consumed:
-                deadline.changed.set()
 
     server = await asyncio.start_server(handle, "127.0.0.1", port)
 
@@ -273,6 +268,9 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as owned:
             yield owned
 
+    def _has_pending_chatgpt(app: FastAPI) -> bool:
+        return any(p["provider"] == _CHATGPT for p in app.state.oauth_pending.values())
+
     def _mark_attempt(app: FastAPI, pending: dict, status: str) -> None:
         attempts = app.state.oauth_attempts
         attempt_id = pending["attempt_id"]
@@ -282,6 +280,10 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
         finished = [key for key, value in attempts.items() if value != "pending"]
         for key in finished[:-_FINISHED_ATTEMPT_LIMIT]:
             del attempts[key]
+        if pending["provider"] == _CHATGPT and not _has_pending_chatgpt(app):
+            # Close the listening socket, not the callback connection. The
+            # callback can still poll the new account and send its response.
+            app.state.oauth_listener_deadline.changed.set()
 
     def _pop_pending(app: FastAPI, state: str) -> dict:
         app.state.oauth_pending_timers.pop(state).cancel()
@@ -290,8 +292,6 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
     def _expire_pending(app: FastAPI, state: str) -> None:
         pending = _pop_pending(app, state)
         _mark_attempt(app, pending, "expired")
-        if pending["provider"] == _CHATGPT:
-            app.state.oauth_listener_deadline.changed.set()
 
     def _consume_pending(
         app: FastAPI, provider: str, code: str | None, state: str | None
@@ -386,7 +386,7 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
                     if listener_factory is None:
                         task = await _start_chatgpt_listener(
                             port, complete, deadline,
-                            lambda: any(p["provider"] == _CHATGPT for p in app.state.oauth_pending.values()),
+                            lambda: _has_pending_chatgpt(app),
                         )
                     else:
                         task = await listener_factory(port, complete)
@@ -419,8 +419,12 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
     ) -> Response:
         app = request.app
         # The returned code may be {code}#{state}: split and use both parts.
-        if code and "#" in code and not state:
-            code, _, state = code.partition("#")
+        if code:
+            code, _, embedded_state = code.partition("#")
+            if embedded_state:
+                if state and not secrets.compare_digest(state.encode(), embedded_state.encode()):
+                    return _html_error("Invalid or expired sign-in state.")
+                state = embedded_state
         try:
             await _complete_sign_in(app, _CLAUDE, "Claude OAuth", code, state)
         except _UnconsumedOAuthCallbackError:

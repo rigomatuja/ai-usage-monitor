@@ -122,7 +122,7 @@ class UsagePoller:
         try:
             refreshed = await self._refresh_fn(http, provider, credentials)
         except Exception as exc:
-            logger.warning("token refresh failed for %s: %s", account_id, exc)
+            logger.warning("token refresh failed for %s: %s", account_id, type(exc).__name__)
             return None
         rotated = _stringify_credentials(refreshed)
         self._persist(account_id, rotated)
@@ -190,12 +190,13 @@ class UsagePoller:
                 windows=list(self._last_good_windows.get(account_id, [])),
             )
         except Exception as exc:  # defensive: a provider bug must not kill polling
-            logger.exception("unexpected provider failure for %s", account_id)
+            error_type = type(exc).__name__
+            logger.error("unexpected provider failure for %s: %s", account_id, error_type)
             snapshot = UsageSnapshot(
                 account_id=account_id,
                 fetched_at=datetime.now(timezone.utc),
                 status="error",
-                error=f"unexpected error: {exc}",
+                error=f"unexpected error: {error_type}",
                 windows=list(self._last_good_windows.get(account_id, [])),
             )
         else:

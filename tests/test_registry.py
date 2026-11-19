@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 import stat
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -200,6 +202,35 @@ class TestUpdateCredentials:
         stored = reloaded.get_config(account.id)
         assert stored.credentials == self.NEW_CREDENTIALS
         assert stored.origin == "oauth"
+
+    def test_partial_write_preserves_existing_store(self, tmp_path, monkeypatch):
+        registry = make_registry(tmp_path)
+        account = registry.add_account(
+            ProviderKind.claude_personal, "OAuth Claude", {"access_token": "old"},
+            origin="oauth",
+        )
+        sibling = registry.add_account(ProviderKind.openai_org, "Work", {})
+        path = tmp_path / "config" / "accounts.json"
+        original = path.read_bytes()
+        fdopen = os.fdopen
+
+        @contextmanager
+        def partial_write(*args, **kwargs):
+            with fdopen(*args, **kwargs) as handle:
+                def write(payload):
+                    handle.write(payload[:8])
+                    handle.flush()
+                    raise OSError("partial write")
+
+                yield Mock(wraps=handle, write=write)
+
+        monkeypatch.setattr(os, "fdopen", partial_write)
+        with pytest.raises(OSError, match="^partial write$"):
+            registry.update_credentials(account.id, self.NEW_CREDENTIALS)
+
+        assert path.read_bytes() == original
+        assert registry.iter_configs() == [account, sibling]
+        assert list(path.parent.iterdir()) == [path]
 
     def test_update_credentials_preserves_identity_and_siblings(self, tmp_path):
         registry = make_registry(tmp_path)

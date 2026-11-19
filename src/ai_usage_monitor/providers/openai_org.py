@@ -113,7 +113,10 @@ class OpenAIOrgProvider(UsageProvider):
         headers: dict[str, str],
         what: str,
     ) -> object:
-        response = await http.get(url, params=params, headers=headers)
+        try:
+            response = await http.get(url, params=params, headers=headers)
+        except httpx.HTTPError as exc:
+            raise ProviderError(f"openai_org {what} request failed: {type(exc).__name__}") from None
         if response.status_code >= 400:
             raise ProviderError(f"openai_org {what} failed: HTTP {response.status_code}")
         try:

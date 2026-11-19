@@ -298,6 +298,22 @@ async def test_http_429_raises(tmp_path):
         await provider.fetch(http)
 
 
+async def test_request_failure_does_not_disclose_inline_access_token():
+    marker = "synthetic-chatgpt-secret"
+    provider = ChatGPTPersonalProvider({"access_token": marker + "\n", "account_id": "test"})
+
+    def reject_header(request):
+        # MockTransport bypasses wire validation; simulate httpx rejecting the header.
+        header = request.headers["authorization"]
+        assert header == f"Bearer {marker}\n"
+        raise httpx.LocalProtocolError(f"Illegal header value {header!r}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(reject_header)) as http:
+        with pytest.raises(ProviderError) as caught:
+            await provider.fetch(http)
+    assert str(caught.value) == "ChatGPT usage request failed: LocalProtocolError"
+
+
 async def test_invalid_json_raises(tmp_path):
     auth = write_auth(tmp_path, auth_payload())
     provider = ChatGPTPersonalProvider({"auth_path": str(auth)})

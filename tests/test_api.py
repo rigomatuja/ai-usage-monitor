@@ -463,16 +463,50 @@ class TestClaudeCallback:
             u["account_id"] == infos[0].id and u["status"] == "ok" for u in usage
         )
 
-    def test_code_state_twist_is_accepted(self, oauth_env):
+    @pytest.mark.parametrize("include_query_state", [False, True])
+    def test_code_state_twist_is_accepted(self, oauth_env, include_query_state):
         state = _login_claude(oauth_env)
+        params = {"code": f"auth-code#{state}"}
+        if include_query_state:
+            params["state"] = state
 
-        response = oauth_env.client.get(
-            "/api/oauth/claude/callback",
-            params={"code": f"auth-code#{state}"},
-        )
+        response = oauth_env.client.get("/api/oauth/claude/callback", params=params)
 
         assert response.status_code == 200
         assert len(oauth_env.registry.list_infos()) == 1
+
+    @pytest.mark.parametrize("non_ascii", [False, True])
+    def test_conflicting_code_and_query_states_leave_both_attempts_pending(self, oauth_env, monkeypatch, non_ascii):
+        from ai_usage_monitor.oauth import ClaudeOAuthClient
+
+        exchange = oauth_env.claude.exchange_code
+
+        async def validate_exchange(http, code, verifier, state):
+            await exchange(http, code, verifier, state)
+            ClaudeOAuthClient._split_code(code, state)
+            return oauth_env.claude.exchange_result
+
+        monkeypatch.setattr(oauth_env.claude, "exchange_code", validate_exchange)
+        client = oauth_env.client
+        login_path = "/api/oauth/claude_personal/login"
+        callback = "/api/oauth/claude/callback"
+        first, second = client.post(login_path), client.post(login_path)
+        assert first.status_code == second.status_code == 200
+        embedded = "ñ" if non_ascii else _state(second)
+
+        response = client.get(callback, params={"code": f"auth-code#{embedded}", "state": _state(first)})
+
+        assert response.status_code == 400
+        assert client.get(_attempt(first)).json() == {"status": "pending"}
+        assert client.get(_attempt(second)).json() == {"status": "pending"}
+        assert response.headers["content-type"] == "text/html; charset=utf-8"
+        assert "Invalid or expired sign-in state." in response.text
+        assert oauth_env.claude.exchange_calls == []
+        assert client.get("/api/accounts").json() == []
+        assert client.get(callback, params={"code": "auth-code", "state": _state(first)}).status_code == 200
+        assert client.get(_attempt(first)).json() == {"status": "completed"}
+        assert client.get(_attempt(second)).json() == {"status": "pending"}
+        assert len(client.get("/api/accounts").json()) == 1
 
     def test_state_mismatch_is_400_html_without_tokens(self, oauth_env):
         client = oauth_env.client
@@ -639,6 +673,59 @@ async def test_chatgpt_listener_serves_both_attempts_and_rejects_unknown_state(
                 ("auth-code", verifier, state) for verifier, state in oauth_env.chatgpt.authorize_calls
             ]
         finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_chatgpt_listener_signals_stop_before_post_login_poll_finishes(oauth_env, monkeypatch):
+    from ai_usage_monitor.app import create_app
+
+    start_server = asyncio.start_server
+    port = 0
+
+    async def bind_ephemeral(*args, **kwargs):
+        nonlocal port
+        server = await start_server(*args, **kwargs)
+        port = server.sockets[0].getsockname()[1]
+        return server
+
+    poller = oauth_env.app.state.poller
+    original_poll = poller.poll_account
+    polling, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_poll(*args):
+        polling.set()
+        await release.wait()
+        return await original_poll(*args)
+
+    monkeypatch.setattr(asyncio, "start_server", bind_ephemeral)
+    monkeypatch.setattr(poller, "poll_account", slow_poll)
+    app = create_app(registry=oauth_env.registry, poller=poller, start_background=False,
+                     oauth_callback_port=0, oauth_clients={"chatgpt_personal": oauth_env.chatgpt})
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                 base_url="http://test", headers=DASHBOARD_HEADERS) as client:
+        login = await client.post("/api/oauth/chatgpt_personal/login")
+        assert login.status_code == 200
+        task = app.state.oauth_listener_task
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(f"GET /auth/callback?code=auth-code&state={_state(login)} HTTP/1.1\r\n\r\n".encode())
+            await writer.drain()
+            try:
+                await asyncio.wait_for(polling.wait(), 2)
+                assert (await client.get(_attempt(login))).json() == {"status": "completed"}
+                assert (await client.get("/api/usage")).json() == []
+                assert app.state.oauth_listener_deadline.changed.is_set()
+            finally:
+                release.set()
+                response = await asyncio.wait_for(reader.read(), 2)
+            assert response == (b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:61524/\r\n"
+                                b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+            await asyncio.wait_for(asyncio.shield(task), 2)
+            assert [snapshot["status"] for snapshot in (await client.get("/api/usage")).json()] == ["ok"]
+        finally:
+            writer.close()
+            await writer.wait_closed()
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 

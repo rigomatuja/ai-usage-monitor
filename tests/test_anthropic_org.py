@@ -191,6 +191,17 @@ async def test_http_errors_raise_provider_error(status):
         await fetch_with(provider, handler)
 
 
+async def test_request_failure_does_not_disclose_api_key():
+    provider = AnthropicOrgProvider({"api_key": "synthetic-anthropic-secret"})
+
+    def handler(request):
+        raise httpx.ReadError(f"Request failed for {request.headers['x-api-key']}")
+
+    with pytest.raises(ProviderError) as caught:
+        await fetch_with(provider, handler)
+    assert str(caught.value) == "anthropic_org usage report request failed: ReadError"
+
+
 async def test_malformed_json_raises_provider_error():
     provider = AnthropicOrgProvider({"api_key": "sk-ant-admin-test"})
 

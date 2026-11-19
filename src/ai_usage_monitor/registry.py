@@ -91,19 +91,23 @@ class AccountRegistry:
     def _save_manual(self, accounts: list[AccountConfig]) -> None:
         self._config_dir.mkdir(parents=True, exist_ok=True)
         payload = json.dumps([account.model_dump(mode="json") for account in accounts], indent=2) + "\n"
-        # Create the file with 0600 from the very first write: write_text()
-        # would create it world/group-readable (umask default) until a later
-        # chmod, exposing credentials in a transient window on multi-user
-        # hosts.
-        fd = os.open(
-            self._accounts_file,
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-            0o600,
-        )
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-        # Defense in depth for files created by older versions.
-        os.chmod(self._accounts_file, 0o600)
+        # Write privately beside the target so an interrupted write cannot
+        # truncate the live store and replacement stays on the same filesystem.
+        temp = self._accounts_file.with_name(f".tmp-{uuid.uuid4().hex}-{self._accounts_file.name}")
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            try:
+                os.fchmod(fd, 0o600)  # Ensure the exact mode even with a restrictive umask.
+                with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(temp, self._accounts_file)
+        except BaseException:
+            temp.unlink(missing_ok=True)
+            raise
 
     # -- public API ---------------------------------------------------------
 
