@@ -125,12 +125,18 @@ async def _start_chatgpt_listener(
                 )
                 await writer.drain()
                 return  # keep waiting for the real callback
-            params = parse_qs(parsed.query)
+            # keep_blank_values: "state=&state=X" must count as a duplicate.
+            params = parse_qs(parsed.query, keep_blank_values=True)
             code = (params.get("code") or [None])[0]
             state = (params.get("state") or [None])[0]
-            if len(params.get("code", [])) > 1 or len(params.get("state", [])) > 1:
-                # Ambiguous callback: reject like an unknown state, so no
-                # attempt is consumed and the listener keeps serving.
+            if (
+                len(params.get("code", [])) > 1
+                or len(params.get("state", [])) > 1
+                or (code is not None and "#" in code)
+            ):
+                # Ambiguous or malformed callback (OpenAI codes never embed a
+                # state): reject like an unknown state, so no attempt is
+                # consumed and the listener keeps serving.
                 state = None
             try:
                 location = await complete(code, state)
