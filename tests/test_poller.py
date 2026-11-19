@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 from unittest.mock import DEFAULT, AsyncMock, Mock
 
 import httpx
@@ -93,17 +94,45 @@ class TestPoller:
         # Last good windows survive inside the error snapshot.
         assert snapshot.windows == fake_windows
 
-    async def test_unexpected_provider_exception_is_contained(self, setup, http):
+    async def test_request_failure_does_not_disclose_token_in_snapshot_or_api(self, setup):
+        registry, _ = setup
+        marker = "synthetic-usage-secret"
+        account = registry.add_account(
+            ProviderKind.claude_personal, "OAuth Claude", {"access_token": marker + "\n"},
+            origin="oauth",
+        )
+        poller = UsagePoller(registry)
+        app = create_app(registry=registry, poller=poller, start_background=False)
+
+        def reject_header(request):
+            header = request.headers["authorization"]
+            assert header == f"Bearer {marker}\n"
+            raise httpx.LocalProtocolError(f"Illegal header value {header!r}")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(reject_header)) as http:
+            snapshot = await poller.poll_account(account.id, http)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/api/usage")
+
+        assert snapshot.status == "error"
+        assert response.status_code == 200
+        assert marker not in (snapshot.error or "")
+        assert marker not in response.text
+        assert response.json() == [snapshot.model_dump(mode="json")]
+
+    async def test_unexpected_provider_exception_is_contained(self, setup, http, caplog):
         _, poller = setup
+        marker = "synthetic-provider-secret"
 
         class Exploding(FakeProvider):
             async def fetch(self, http):
-                raise RuntimeError("provider bug")
+                raise RuntimeError(marker)
 
         poller._provider_factory = lambda config: Exploding(config.credentials)
         snapshot = await poller.poll_account("auto-claude-personal", http)
         assert snapshot.status == "error"
-        assert "unexpected error" in snapshot.error
+        assert snapshot.error == "unexpected error: RuntimeError"
+        assert marker not in caplog.text
 
     async def test_unknown_account_raises_keyerror(self, setup, http):
         _, poller = setup
@@ -258,6 +287,32 @@ class TestPrefetchRefresh:
         if not persist_fails:
             assert await poller.flush_unpersisted() == []
         assert persist.call_count == 2
+        refresh.assert_awaited_once_with(http, ProviderKind.claude_personal, self.OLD_CREDENTIALS)
+
+    async def test_flush_unpersisted_recovers_from_partial_write(self, setup, http, monkeypatch):
+        registry, _ = setup
+        account = self._add_oauth_account(registry)
+        refresh = AsyncMock(return_value=self.ROTATED)
+        poller = UsagePoller(registry, lambda c: FakeProvider(c.credentials), refresh_fn=refresh)
+        fdopen = os.fdopen
+
+        @contextlib.contextmanager
+        def partial_write(*args, **kwargs):
+            with fdopen(*args, **kwargs) as handle:
+                def write(payload):
+                    handle.write(payload[:8])
+                    handle.flush()
+                    raise OSError("partial write")
+
+                yield Mock(wraps=handle, write=write)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "fdopen", partial_write)
+            assert (await poller.poll_account(account.id, http)).status == "ok"
+
+        assert registry.get_config(account.id) == account
+        assert await poller.flush_unpersisted() == []
+        assert registry.get_config(account.id).credentials == dict(self.ROTATED, expires_at="1893456000000")
         refresh.assert_awaited_once_with(http, ProviderKind.claude_personal, self.OLD_CREDENTIALS)
 
     async def test_flush_loop_retries_without_polling(self, setup, http, monkeypatch):
@@ -555,8 +610,10 @@ class TestPrefetchRefresh:
         registry, _ = setup
         account = self._add_oauth_account(registry)
 
+        marker = "synthetic-refresh-secret"
+
         async def refresh(http_arg, provider, credentials):
-            raise OAuthError("refresh rejected by provider")
+            raise OAuthError(f"refresh rejected by provider: {marker}")
 
         seen = []
 
@@ -582,4 +639,5 @@ class TestPrefetchRefresh:
         assert registry.get_config(account.id).credentials == self.OLD_CREDENTIALS
         # Failure was logged at warning level.
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert any("refresh" in r.getMessage().lower() for r in warnings)
+        assert [r.getMessage() for r in warnings] == [f"token refresh failed for {account.id}: OAuthError"]
+        assert marker not in caplog.text

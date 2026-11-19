@@ -96,7 +96,12 @@ class AnthropicOrgProvider(UsageProvider):
         # Pagination is not followed in v1: if the API returns a next_page
         # token we simply aggregate the page that was returned (the 7 daily
         # buckets we ask for fit in a single page at limit=7).
-        response = await http.get(_USAGE_REPORT_URL, params=params, headers=headers)
+        try:
+            response = await http.get(_USAGE_REPORT_URL, params=params, headers=headers)
+        except httpx.HTTPError as exc:
+            raise ProviderError(
+                f"anthropic_org usage report request failed: {type(exc).__name__}"
+            ) from None
         if response.status_code >= 400:
             raise ProviderError(
                 f"anthropic_org usage report failed: HTTP {response.status_code}"

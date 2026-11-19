@@ -281,6 +281,20 @@ async def test_http_errors_raise_provider_error(endpoint, status):
         await fetch_with(provider, handler)
 
 
+@pytest.mark.parametrize("report", ["usage", "costs"])
+async def test_request_failure_does_not_disclose_api_key(report):
+    provider = OpenAIOrgProvider({"api_key": "synthetic-openai-secret"})
+
+    def handler(request):
+        if report == "costs" and request.url.path.endswith("/completions"):
+            return httpx.Response(200, json=make_usage_body())
+        raise httpx.ReadError(f"Request failed for {request.headers['authorization']}")
+
+    with pytest.raises(ProviderError) as caught:
+        await fetch_with(provider, handler)
+    assert str(caught.value) == f"openai_org {report} report request failed: ReadError"
+
+
 @pytest.mark.parametrize("endpoint", ["usage", "costs"])
 async def test_malformed_json_raises_provider_error(endpoint):
     provider = ok_provider()
