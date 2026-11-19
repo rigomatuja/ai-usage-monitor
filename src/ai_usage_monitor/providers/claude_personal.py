@@ -136,22 +136,23 @@ class ClaudePersonalProvider(UsageProvider):
         limits = payload.get("limits")
         if isinstance(limits, list) and limits:
             windows = self._parse_limits(limits, subscription_type)
-            has_session = any(
-                isinstance(entry, dict) and entry.get("kind") == "session"
-                for entry in limits
-            )
         else:
-            windows = self._parse_top_level(payload, subscription_type)
-            has_session = False
-        if not has_session and payload.get("five_hour") is None:
-            kind = WindowKind.five_hour
+            weekly = self._parse_top_level_window(
+                payload.get("seven_day"), WindowKind.weekly, subscription_type
+            )
+            windows = [weekly] if weekly is not None else []
+
+        kind = WindowKind.five_hour
+        if any(window.kind == kind for window in windows):
+            return sorted(windows, key=lambda window: window.kind != kind)
+
+        session = self._parse_top_level_window(payload.get("five_hour"), kind, subscription_type)
+        if session is None:
             detail = "No active session"
             if subscription_type:
                 detail = f"{subscription_type} · {detail}"
-            windows.append(
-                UsageWindow(kind=kind, label=_WINDOW_KINDS[kind], used_percent=0.0, detail=detail)
-            )
-        return sorted(windows, key=lambda window: window.kind != WindowKind.five_hour)
+            session = UsageWindow(kind=kind, label=_WINDOW_KINDS[kind], used_percent=0.0, detail=detail)
+        return [session, *windows]
 
     def _parse_limits(
         self, limits: list[Any], subscription_type: str | None
@@ -194,27 +195,18 @@ class ClaudePersonalProvider(UsageProvider):
             )
         return windows
 
-    def _parse_top_level(
-        self, payload: dict[str, Any], subscription_type: str | None
-    ) -> list[UsageWindow]:
-        windows: list[UsageWindow] = []
-        for key, kind in (
-            ("five_hour", WindowKind.five_hour),
-            ("seven_day", WindowKind.weekly),
-        ):
-            entry = payload.get(key)
-            if not isinstance(entry, dict):
-                continue
-            utilization = entry.get("utilization")
-            if not _is_number(utilization):
-                continue
-            windows.append(
-                UsageWindow(
-                    kind=kind,
-                    label=_WINDOW_KINDS[kind],
-                    used_percent=float(utilization),
-                    detail=subscription_type,
-                    resets_at=_parse_resets_at(entry.get("resets_at")),
-                )
-            )
-        return windows
+    def _parse_top_level_window(
+        self, entry: Any, kind: WindowKind, subscription_type: str | None
+    ) -> UsageWindow | None:
+        if not isinstance(entry, dict):
+            return None
+        utilization = entry.get("utilization")
+        if not _is_number(utilization):
+            return None
+        return UsageWindow(
+            kind=kind,
+            label=_WINDOW_KINDS[kind],
+            used_percent=float(utilization),
+            detail=subscription_type,
+            resets_at=_parse_resets_at(entry.get("resets_at")),
+        )

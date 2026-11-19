@@ -200,6 +200,24 @@ class TestCustomLabels:
         path = tmp_path / "config" / "labels.json"
         assert json.loads(path.read_text(encoding="utf-8")) == {AUTO_CLAUDE_ID: "Personal"}
 
+    @pytest.mark.parametrize("label, reason", [
+        ("\ud800", "label must be valid UTF-8"),
+        ("A\u0000B", "label must not contain control characters"),
+        ("A\u009fB", "label must not contain control characters"),
+    ])
+    def test_set_label_rejects_invalid_characters_before_writing(self, tmp_path, label, reason):
+        registry = make_registry(tmp_path, claude=True)
+        registry.set_label(AUTO_CLAUDE_ID, "Personal")
+        before = registry.list_infos()
+        labels_path = tmp_path / "config" / "labels.json"
+        original = labels_path.read_bytes()
+
+        with pytest.raises(ValueError, match=f"^{reason}$"):
+            registry.set_label(AUTO_CLAUDE_ID, label)
+
+        assert labels_path.read_bytes() == original
+        assert registry.list_infos() == before
+
     def test_set_label_rejects_invalid_length_and_unknown_account(self, tmp_path):
         registry = make_registry(tmp_path, claude=True)
         before = registry.list_infos()

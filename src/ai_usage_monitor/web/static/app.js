@@ -212,10 +212,14 @@ function renderCardUsage(usage, snapshot) {
     status.textContent = `error: ${snapshot.error || "unknown error"}`;
   } else if (snapshot && snapshot.fetched_at) {
     status.classList.add("ok");
-    status.textContent = `ok · updated ${fmtRelativeAge(snapshot.fetched_at)} · ${fmtLocalDateTime(snapshot.fetched_at)}`;
+    status.textContent = "ok";
   } else {
     status.classList.add("ok");
     status.textContent = "no usage data yet";
+  }
+  if (snapshot?.fetched_at) {
+    const fetchedAt = snapshot.fetched_at;
+    status.textContent += ` · updated ${fmtRelativeAge(fetchedAt)} · ${fmtLocalDateTime(fetchedAt)}`;
   }
   usage.replaceChildren(status);
 

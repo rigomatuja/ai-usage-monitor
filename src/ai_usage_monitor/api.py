@@ -179,7 +179,10 @@ class NewAccountRequest(BaseModel):
 
 
 class RenameAccountRequest(BaseModel):
-    label: str | None = Field(description="Up to 80 characters after trimming; null or blank clears the name.")
+    label: str | None = Field(
+        description="UTF-8 text without control characters, up to 80 characters after trimming; "
+        "null or blank clears the name.",
+    )
 
 
 def _require_dashboard_origin(request: Request, *, denied_detail: str) -> None:

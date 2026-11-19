@@ -206,6 +206,13 @@ async function exerciseAccounts(scenario, elements, requests, initial, poll) {
 }
 
 function exerciseDates(scenario, card) {
+  if (scenario === "error-date") {
+    const status = card.querySelector(".card-status");
+    assert.ok(status.classList.contains("error"));
+    assert.match(status.textContent,
+      /^error: offline · updated 5 min ago · Thu 19 Nov, 13:10 (?:CET|GMT\+1)$/);
+    return;
+  }
   const windows = card.querySelector(".windows").children;
   if (scenario === "no-reset") {
     assert.equal(windows[4].querySelector(".window-reset"), null);
@@ -233,7 +240,7 @@ async function main() {
   const authorizeUrl = "https://example.invalid/authorize?state=claude";
   const old = account("old");
   const other = account("other", "chatgpt_personal");
-  const dates = ["dates", "no-reset"].includes(scenario);
+  const dates = ["dates", "no-reset", "error-date"].includes(scenario);
   const accounts = ["rename", "clear", "reset-default", "rename-error", "add-blank", "add-named", "remove"].includes(scenario);
   const initial = accounts ? [
     { ...old, source: "auto", label: "Claude (local login)", default_label: "Claude (local login)" },
@@ -243,7 +250,10 @@ async function main() {
   const popupResult = scenario === "unblocked" ? popup : null;
   let opens = 0;
   let attemptStatus = "pending";
-  const requests = [["GET", "/api/accounts", initial], ["GET", "/api/usage", dates ? [snapshot] : []]];
+  const usage = scenario === "error-date"
+    ? [{ ...snapshot, status: "error", error: "offline", windows: [] }]
+    : dates ? [snapshot] : [];
+  const requests = [["GET", "/api/accounts", initial], ["GET", "/api/usage", usage]];
   let poll;
   const context = vm.createContext({
     Date: class extends Date { static now() { return Date.parse(now); } },

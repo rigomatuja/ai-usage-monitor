@@ -147,8 +147,12 @@ async def test_limits_array_preferred_over_top_level(tmp_path):
         [
             ok(
                 {
-                    "limits": [{"kind": "weekly_all", "percent": 7.0, "resets_at": None}],
+                    "limits": [
+                        {"kind": "weekly_all", "percent": 7.0, "resets_at": None},
+                        {"kind": "session", "percent": 12.0, "resets_at": None},
+                    ],
                     "five_hour": {"utilization": 99.0, "resets_at": None},
+                    "seven_day": {"utilization": 88.0, "resets_at": None},
                 }
             )
         ],
@@ -157,8 +161,8 @@ async def test_limits_array_preferred_over_top_level(tmp_path):
     provider = ClaudePersonalProvider(credentials_for(creds))
     windows = await provider.fetch(http)
 
-    assert [w.kind for w in windows] == [WindowKind.weekly]
-    assert [w.used_percent for w in windows] == [7.0]
+    assert [w.kind for w in windows] == [WindowKind.five_hour, WindowKind.weekly]
+    assert [w.used_percent for w in windows] == [12.0, 7.0]
 
 
 # ------------------------------------------------------- credentials handling
@@ -316,6 +320,34 @@ def inactive_session(subscription: str | None = None) -> UsageWindow:
         detail=f"{subscription} · No active session" if subscription else "No active session",
         resets_at=None,
     )
+
+
+@pytest.mark.parametrize("session_entries, top_level", [
+    ([], {"utilization": 27, "resets_at": "2026-11-05T18:00:00Z"}),
+    ([{"kind": "session", "percent": None}], {"utilization": 27, "resets_at": "2026-11-05T18:00:00Z"}),
+    ([{"kind": "session", "percent": None}], None),
+    ([], {"utilization": None}),
+])
+async def test_missing_usable_limits_session_falls_back(tmp_path, session_entries, top_level):
+    subscription = "claude_code_max"
+    creds = write_credentials(tmp_path, cred_payload())
+    payload = {"limits": [{"kind": "weekly_all", "percent": 11}, *session_entries]}
+    if top_level is not None:
+        payload["five_hour"] = top_level
+    provider = ClaudePersonalProvider(credentials_for(creds))
+    async with make_http([ok(payload)], []) as http:
+        windows = await provider.fetch(http)
+
+    expected_session = inactive_session(subscription)
+    if top_level and top_level["utilization"] == 27:
+        expected_session = UsageWindow(
+            kind=WindowKind.five_hour, label="5-hour session", used_percent=27,
+            detail=subscription, resets_at=datetime(2026, 11, 5, 18, 0, tzinfo=timezone.utc),
+        )
+    assert windows == [
+        expected_session,
+        UsageWindow(kind=WindowKind.weekly, label="Weekly", used_percent=11, detail=subscription),
+    ]
 
 
 async def test_empty_response_yields_only_inactive_session(tmp_path):

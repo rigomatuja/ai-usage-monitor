@@ -26,7 +26,7 @@ def test_account_names(scenario):
     run_harness(scenario)
 
 
-@pytest.mark.parametrize("scenario", ["dates", "no-reset"])
+@pytest.mark.parametrize("scenario", ["dates", "no-reset", "error-date"])
 def test_reset_dates(scenario):
     run_harness(scenario)
 

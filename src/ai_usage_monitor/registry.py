@@ -36,7 +36,21 @@ class AccountError(Exception):
 
 
 class InvalidAccountLabel(ValueError):
-    """A custom label violates the label length limit."""
+    """A custom label has invalid text or exceeds the length limit."""
+
+
+def _normalize_custom_label(label: str) -> str:
+    try:
+        label.encode("utf-8")
+    except UnicodeEncodeError:
+        raise InvalidAccountLabel("label must be valid UTF-8") from None
+    # Validate before trimming: tabs, newlines and other controls aren't names.
+    if any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in label):
+        raise InvalidAccountLabel("label must not contain control characters")
+    label = label.strip()
+    if len(label) > 80:
+        raise InvalidAccountLabel("label must be at most 80 characters")
+    return label
 
 
 class AccountRegistry:
@@ -104,7 +118,17 @@ class AccountRegistry:
             return {}
         if not isinstance(raw, dict):
             return {}
-        return {key: value for key, value in raw.items() if isinstance(value, str) and value}
+        labels: dict[str, str] = {}
+        for key, value in raw.items():
+            if not isinstance(value, str):
+                continue
+            try:
+                label = _normalize_custom_label(value)
+            except InvalidAccountLabel:
+                continue
+            if label:
+                labels[key] = label
+        return labels
 
     def _save_json(self, path: Path, data: list[dict] | dict[str, str]) -> None:
         self._config_dir.mkdir(parents=True, exist_ok=True)
@@ -155,9 +179,7 @@ class AccountRegistry:
         account = self.get_config(account_id)
         if account is None:
             raise KeyError(account_id)
-        label = (label or "").strip()
-        if len(label) > 80:
-            raise InvalidAccountLabel("label must be at most 80 characters")
+        label = _normalize_custom_label(label or "")
         labels = self._load_labels()
         if label:
             labels[account_id] = label
@@ -183,8 +205,9 @@ class AccountRegistry:
         remaining = [a for a in accounts if a.id != account_id]
         if len(remaining) == len(accounts):
             raise KeyError(account_id)
-        self._save_manual(remaining)
+        # If label cleanup fails, leave the account and its credentials intact.
         self._drop_label(account_id, self._load_labels())
+        self._save_manual(remaining)
 
     def update_credentials(self, account_id: str, credentials: dict[str, str]) -> None:
         """Replace the stored credentials of a manual account and persist

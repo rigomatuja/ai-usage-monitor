@@ -10,6 +10,19 @@ import uvicorn
 from ai_usage_monitor.app import create_app
 
 
+class _RedactAccessQuery(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Uvicorn's HTTP protocols pass (client, method, target, version, status).
+        # Keep that tuple shape for Uvicorn's AccessFormatter.
+        if isinstance(record.args, tuple) and len(record.args) == 5:
+            client, method, target, version, status = record.args
+            if isinstance(target, str):
+                path, separator, _ = target.partition("?")
+                if separator:
+                    record.args = (client, method, f"{path}?<redacted>", version, status)
+        return True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="ai-usage-monitor",
@@ -31,6 +44,8 @@ def main() -> None:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    logging.getLogger("uvicorn.access").addFilter(_RedactAccessQuery())
 
     app = create_app(app_port=args.port)
     uvicorn.run(app, host=args.host, port=args.port, log_level=None)

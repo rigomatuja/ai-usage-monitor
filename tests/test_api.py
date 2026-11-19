@@ -4,7 +4,9 @@ frontend side of the same contract)."""
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
@@ -35,7 +37,7 @@ class FakeProvider:
 
 
 @pytest.fixture
-def client(tmp_path):
+def accounts_app(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
     (home / ".codex").mkdir()
@@ -50,8 +52,18 @@ def client(tmp_path):
     )
     from ai_usage_monitor.app import create_app
 
-    app = create_app(registry=registry, poller=poller, start_background=False)
-    with TestClient(app) as test_client:
+    return create_app(registry=registry, poller=poller, start_background=False)
+
+
+@pytest.fixture
+def client(accounts_app):
+    with TestClient(accounts_app) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def non_raising_client(accounts_app):
+    with TestClient(accounts_app, raise_server_exceptions=False) as test_client:
         yield test_client
 
 
@@ -115,7 +127,7 @@ class TestAccountsEndpoints:
         assert body["custom_label"] is False
         assert body in client.get("/api/accounts").json()
 
-    @pytest.mark.parametrize("clear", [None, "", " \t "])
+    @pytest.mark.parametrize("clear", [None, "", "   "])
     def test_rename_auto_and_clear_to_default(self, client, clear):
         before, = client.get("/api/accounts").json()
         assert before == {
@@ -172,15 +184,95 @@ class TestAccountsEndpoints:
         assert client.get("/api/accounts").json() == accounts
         assert client.get("/api/usage").json() == usage
 
-    def test_delete_manual_account_returns_204(self, client):
+    @pytest.mark.parametrize("payload, detail", [
+        (br'{"label":"\ud800"}', "label must be valid UTF-8"),
+        (br'{"label":"A\u0000B"}', "label must not contain control characters"),
+        (br'{"label":" \t "}', "label must not contain control characters"),
+        (br'{"label":"A\u007fB"}', "label must not contain control characters"),
+        (br'{"label":"A\u0085B"}', "label must not contain control characters"),
+    ])
+    def test_rename_rejects_invalid_characters_without_writing(
+        self, non_raising_client, tmp_path, payload, detail,
+    ):
+        client = non_raising_client
+        path = "/api/accounts/auto-chatgpt-personal"
+        rename = client.patch(path, json={"label": "Personal"}, headers=DASHBOARD_HEADERS)
+        assert rename.status_code == 200
+        labels_path = tmp_path / "config" / "labels.json"
+        before = labels_path.read_bytes()
+        usage = client.get("/api/usage").json()
+
+        response = client.patch(
+            path, content=payload, headers={**DASHBOARD_HEADERS, "Content-Type": "application/json"},
+        )
+
+        assert response.status_code == 422
+        assert response.json() == {"detail": detail}
+        assert labels_path.read_bytes() == before
+        listing = client.get("/api/accounts")
+        assert (listing.status_code, listing.json()) == (200, [rename.json()])
+        assert client.get("/api/usage").json() == usage
+
+    @pytest.mark.parametrize("invalid_label", [23, "\ud800", "A\u0085B", " ", "x" * 81])
+    def test_list_accounts_ignores_invalid_stored_label(self, non_raising_client, tmp_path, invalid_label):
+        client = non_raising_client
+        default, = client.get("/api/accounts").json()
+        manual = client.post("/api/accounts", json={"provider": "openai_org"}).json()
+        labels = {default["id"]: invalid_label, manual["id"]: "Valid name"}
+        labels_path = tmp_path / "config" / "labels.json"
+        before = json.dumps(labels).encode("utf-8")
+        labels_path.write_bytes(before)
+
+        listing = client.get("/api/accounts")
+
+        assert listing.status_code == 200
+        assert listing.json() == [default, {**manual, "label": "Valid name", "custom_label": True}]
+        assert labels_path.read_bytes() == before
+
+    def test_delete_manual_account_returns_204(self, client, tmp_path):
         body = client.post(
             "/api/accounts",
             json={"provider": "openai_org", "label": "Org", "credentials": {}},
         ).json()
-        response = client.delete(f"/api/accounts/{body['id']}")
-        assert response.status_code == 204
-        assert all(a["id"] != body["id"]
-                   for a in client.get("/api/accounts").json())
+        path = f"/api/accounts/{body['id']}"
+        rename = client.patch(path, json={"label": "Renamed"}, headers=DASHBOARD_HEADERS)
+        assert rename.status_code == 200
+        response = client.delete(path)
+        assert (response.status_code, response.content) == (204, b"")
+        assert all(a["id"] != body["id"] for a in client.get("/api/accounts").json())
+        config = tmp_path / "config"
+        assert json.loads((config / "accounts.json").read_bytes()) == []
+        assert json.loads((config / "labels.json").read_bytes()) == {}
+
+    def test_delete_label_cleanup_failure_preserves_account(self, non_raising_client, tmp_path, monkeypatch):
+        client = non_raising_client
+        added = client.post("/api/accounts", json={"provider": "openai_org", "credentials": {"api_key": "fixture"}})
+        assert added.status_code == 201
+        path = f"/api/accounts/{added.json()['id']}"
+        rename = client.patch(path, json={"label": "Renamed"}, headers=DASHBOARD_HEADERS)
+        assert rename.status_code == 200
+        accounts = client.get("/api/accounts").json()
+        usage = client.get("/api/usage").json()
+        config = tmp_path / "config"
+        accounts_path = config / "accounts.json"
+        labels_path = config / "labels.json"
+        files_before = (accounts_path.read_bytes(), labels_path.read_bytes())
+        replace = os.replace
+
+        def fail_labels_replace(source, target):
+            if target == labels_path:
+                raise OSError("label replacement failed")
+            replace(source, target)
+
+        monkeypatch.setattr(os, "replace", fail_labels_replace)
+        response = client.delete(path)
+
+        assert (response.status_code, response.text) == (500, "Internal Server Error")
+        files_after = (accounts_path.read_bytes(), labels_path.read_bytes())
+        unchanged = files_before == files_after
+        assert unchanged, "accounts.json and labels.json must both be unchanged"
+        assert client.get("/api/accounts").json() == accounts
+        assert client.get("/api/usage").json() == usage
 
     def test_delete_auto_account_returns_409(self, client):
         response = client.delete("/api/accounts/auto-chatgpt-personal")
