@@ -88,9 +88,9 @@ class ClaudePersonalProvider(UsageProvider):
         except httpx.HTTPError as exc:
             raise ProviderError(f"Claude usage request failed: {exc}") from exc
         if response.status_code >= 400:
-            raise ProviderError(
-                f"Claude usage endpoint returned HTTP {response.status_code}"
-            )
+            error = ProviderError(f"Claude usage endpoint returned HTTP {response.status_code}")
+            error.status_code = response.status_code  # lets the poller retry once on 401
+            raise error
         try:
             payload = response.json()
         except ValueError as exc:
@@ -100,7 +100,13 @@ class ClaudePersonalProvider(UsageProvider):
         return self._parse_windows(payload, subscription_type)
 
     def _load_credentials(self) -> tuple[str, str | None]:
-        """Read the credentials file. Read-only; never writes or refreshes."""
+        """Inline OAuth tokens win; otherwise read the credentials file.
+        Read-only; never writes or refreshes."""
+        inline_token = self.credentials.get("access_token")
+        if inline_token:
+            # OAuth account (T2): tokens come from the registry, never the
+            # local CLI login file.
+            return inline_token, None
         raw_path = self.credentials.get("credentials_path") or DEFAULT_CREDENTIALS_PATH
         path = Path(raw_path).expanduser()
         try:

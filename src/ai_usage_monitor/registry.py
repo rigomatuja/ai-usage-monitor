@@ -11,6 +11,7 @@ import json
 import os
 import uuid
 from pathlib import Path
+from typing import Literal
 
 from platformdirs import user_config_dir
 
@@ -107,14 +108,20 @@ class AccountRegistry:
     # -- public API ---------------------------------------------------------
 
     def add_account(
-        self, provider: ProviderKind, label: str, credentials: dict[str, str]
+        self,
+        provider: ProviderKind,
+        label: str,
+        credentials: dict[str, str],
+        *,
+        origin: Literal["manual", "oauth"] = "manual",
     ) -> AccountConfig:
-        """Persist a new manual account."""
+        """Persist a new account added manually or through OAuth."""
         account = AccountConfig(
             id=f"{provider.value}-{uuid.uuid4().hex[:8]}",
             provider=provider,
             label=label.strip() or provider.value,
             credentials=credentials,
+            origin=origin,
         )
         accounts = self._load_manual()
         accounts.append(account)
@@ -134,6 +141,25 @@ class AccountRegistry:
         if len(remaining) == len(accounts):
             raise KeyError(account_id)
         self._save_manual(remaining)
+
+    def update_credentials(self, account_id: str, credentials: dict[str, str]) -> None:
+        """Replace the stored credentials of a manual account and persist
+        (0600, same rules as ``_save_manual``).
+
+        Raises KeyError for unknown ids and for the auto-detected accounts:
+        their credentials are the CLI-owned login files and are never
+        written by the registry."""
+        if self.is_auto(account_id):
+            raise KeyError(account_id)
+        accounts = self._load_manual()
+        for index, account in enumerate(accounts):
+            if account.id == account_id:
+                accounts[index] = account.model_copy(
+                    update={"credentials": dict(credentials)}
+                )
+                self._save_manual(accounts)
+                return
+        raise KeyError(account_id)
 
     def iter_configs(self) -> list[AccountConfig]:
         """All current accounts: auto-detected first, then manual."""

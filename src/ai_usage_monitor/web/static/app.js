@@ -12,6 +12,7 @@
 const POLL_INTERVAL_MS = 60 * 1000; // server caches and polls providers at >= 300 s
 
 let accounts = [];
+let pendingOauth = null;
 let connectionLost = false;
 
 const $ = (id) => document.getElementById(id);
@@ -25,6 +26,10 @@ const els = {
   label: $("account-label"),
   credentials: $("credentials"),
   formError: $("add-account-error"),
+  signinClaude: $("signin-claude"),
+  signinChatgpt: $("signin-chatgpt"),
+  oauthWaiting: $("oauth-waiting"),
+  oauthError: $("oauth-error"),
 };
 
 /* --- connection banner ----------------------------------------------------- */
@@ -223,6 +228,15 @@ let lastUsage = [];
 
 async function loadAccounts() {
   accounts = await getJson("/api/accounts");
+  const attempt = pendingOauth;
+  if (!attempt?.id) return;
+  const res = await fetchJson(`/api/oauth/attempts/${encodeURIComponent(attempt.id)}`, { cache: "no-store" }).catch(() => null);
+  const result = res?.ok ? await res.json().catch(() => null) : null;
+  if (pendingOauth !== attempt) return;
+  if (result?.status === "completed") clearOauthStatus();
+  if (result?.status === "failed" || result?.status === "expired") {
+    showOauthError(res.headers.get("X-OAuth-Error"));
+  }
 }
 
 async function loadUsage() {
@@ -312,10 +326,82 @@ async function onAddSubmit(event) {
   await refreshAll();
 }
 
+/* --- OAuth sign in ------------------------------------------------------------ */
+
+// Dashboard-origin POST -> 200 {authorize_url, attempt_id}; 404 unknown provider.
+// The authorize URL comes from the server; app.js never hardcodes one.
+const OAUTH_LOGIN_PATHS = {
+  claude_personal: "/api/oauth/claude_personal/login",
+  chatgpt_personal: "/api/oauth/chatgpt_personal/login",
+};
+
+function clearOauthStatus() {
+  pendingOauth = null;
+  els.oauthWaiting.classList.add("hidden");
+  els.oauthWaiting.textContent = "";
+  els.oauthError.classList.add("hidden");
+}
+
+function showOauthError(message) {
+  clearOauthStatus();
+  els.oauthError.textContent = message; // server error message, shown inline
+  els.oauthError.classList.remove("hidden");
+}
+
+async function startOauthLogin(provider) {
+  const tab = window.open("", "_blank");
+  clearOauthStatus(); // clicking again resets any previous status
+  const attempt = {};
+  pendingOauth = attempt;
+  let res;
+  let body = null;
+  try {
+    res = await fetchJson(OAUTH_LOGIN_PATHS[provider], { method: "POST" });
+    body = await res.json();
+  } catch (err) {
+    if (tab) tab.close();
+    if (pendingOauth === attempt) showOauthError("connection lost");
+    return;
+  }
+  if (pendingOauth !== attempt) {
+    if (tab) tab.close();
+    return;
+  }
+  if (!res.ok) {
+    if (tab) tab.close();
+    showOauthError(serverErrorMessage(res, body));
+    return;
+  }
+  if (!body || !body.authorize_url) {
+    if (tab) tab.close();
+    showOauthError("server did not return an authorize URL");
+    return;
+  }
+  attempt.id = body.attempt_id;
+  els.oauthWaiting.textContent = "Waiting for login to complete\u2026";
+  if (tab) {
+    tab.location.href = body.authorize_url;
+  } else {
+    const link = document.createElement("a");
+    link.href = body.authorize_url;
+    link.target = "_blank";
+    link.rel = "noopener";
+    link.textContent = "Open the sign-in page";
+    els.oauthWaiting.replaceChildren(link);
+  }
+  const dismiss = el("button", null, "Dismiss");
+  dismiss.type = "button";
+  dismiss.addEventListener("click", clearOauthStatus);
+  els.oauthWaiting.append(" ", dismiss);
+  els.oauthWaiting.classList.remove("hidden");
+}
+
 /* --- wiring ------------------------------------------------------------------ */
 
 els.refreshBtn.addEventListener("click", onRefreshClick);
 els.form.addEventListener("submit", onAddSubmit);
+els.signinClaude.addEventListener("click", () => startOauthLogin("claude_personal"));
+els.signinChatgpt.addEventListener("click", () => startOauthLogin("chatgpt_personal"));
 
 refreshAll().catch((err) => console.error("initial load failed:", err));
 setInterval(() => {

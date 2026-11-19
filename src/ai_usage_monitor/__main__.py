@@ -32,7 +32,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    app = create_app()
+    app = create_app(app_port=args.port)
     uvicorn.run(app, host=args.host, port=args.port, log_level=None)
 
 

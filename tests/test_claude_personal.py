@@ -258,6 +258,37 @@ async def test_non_object_json_raises(tmp_path):
         await provider.fetch(http)
 
 
+# ---------------------------------------------------------- inline credentials
+
+
+async def test_inline_access_token_used_and_files_never_read():
+    """OAuth accounts carry tokens in credentials; no local file is touched."""
+    seen: list[httpx.Request] = []
+    http = make_http([ok({"limits": [{"kind": "session", "percent": 12.0}]})], seen)
+    provider = ClaudePersonalProvider(
+        {
+            "access_token": ACCESS_TOKEN,
+            "credentials_path": "/nonexistent/inline-test-path/creds.json",
+        }
+    )
+    windows = await provider.fetch(http)
+
+    assert len(seen) == 1
+    request = seen[0]
+    assert request.headers["authorization"] == f"Bearer {ACCESS_TOKEN}"
+    assert request.headers["anthropic-beta"] == "oauth-2025-04-20"
+    assert [w.used_percent for w in windows] == [12.0]
+    assert windows[0].detail is None  # no subscriptionType without a file
+
+
+async def test_inline_credentials_do_not_require_credentials_path_key():
+    seen: list[httpx.Request] = []
+    http = make_http([ok({"limits": []})], seen)
+    provider = ClaudePersonalProvider({"access_token": ACCESS_TOKEN})
+    assert await provider.fetch(http) == []
+    assert str(seen[0].url) == USAGE_URL
+
+
 # ---------------------------------------------------------- tolerant parsing
 
 

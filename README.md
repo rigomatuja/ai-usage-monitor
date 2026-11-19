@@ -42,12 +42,39 @@ deliberately chosen so it does not clash with other local apps; change it with
 
 ## Adding accounts
 
+### OAuth sign-in (multiple personal accounts)
+
+Use the **Sign in with Claude** / **Sign in with ChatGPT** buttons in the
+dashboard to connect additional personal accounts through the browser OAuth
+flow. This is the recommended way to monitor several subscriptions of the
+same platform: each sign-in adds a separate account with its own usage
+windows, stored locally with `0600` permissions. The app refreshes only the
+tokens it obtained itself (both providers rotate refresh tokens); local CLI
+logins are never refreshed or written.
+
+Notes: the ChatGPT flow uses a temporary local listener on port 1455 (fixed
+by OpenAI's app registration); if that port is busy the login returns an
+error. Claude's callback lands on the app's own port (default 61524).
+Several sign-ins can be pending at once; each completes independently, and
+pending sign-ins expire after 10 minutes. Login requests are accepted only
+from the dashboard's own origin.
+
+Known limitation (rotating refresh tokens): when a provider rotates a
+refresh token, the old one stops working as soon as the provider processes
+the refresh. The app never abandons an in-flight refresh (shutdown waits for
+it) and retries saving rotated tokens every 30 seconds, but if the process is
+killed while a refresh response is still in flight, the new token can be
+lost. In that case the account shows an error: sign in again with the same
+button.
+
+### Manual API keys
+
 Accounts are added in the dashboard's **Add account** form:
 
 | Provider | Credentials keys | Notes |
 |---|---|---|
-| `claude_personal` | `credentials_path` (optional) | Defaults to `~/.claude/.credentials.json`; point it at another login's file for a second account |
-| `chatgpt_personal` | `auth_path` (optional) | Defaults to `~/.codex/auth.json` |
+| `claude_personal` | `credentials_path` (optional) | Defaults to `~/.claude/.credentials.json`; point it at another login's file for a second account — or use **Sign in with Claude** below |
+| `chatgpt_personal` | `auth_path` (optional) | Defaults to `~/.codex/auth.json` — or use **Sign in with ChatGPT** below |
 | `anthropic_org` | `api_key` | Admin API key from the Claude Console |
 | `openai_org` | `api_key` | Admin API key from OpenAI |
 

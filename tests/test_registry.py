@@ -94,6 +94,23 @@ class TestManualAccounts:
         )
         assert [i.id for i in reloaded.list_infos()] == [account.id]
 
+    def test_legacy_account_without_origin_loads_as_manual_without_rewrite(self, tmp_path):
+        registry = make_registry(tmp_path)
+        path = tmp_path / "config" / "accounts.json"
+        path.parent.mkdir()
+        credentials = {"access_token": "legacy-at", "refresh_token": "legacy-rt"}
+        payload = json.dumps([{
+            "id": "legacy", "provider": "claude_personal", "label": "Legacy",
+            "credentials": credentials,
+        }])
+        path.write_text(payload, encoding="utf-8")
+
+        account = registry.get_config("legacy")
+
+        assert account.origin == "manual"
+        assert account.credentials == credentials
+        assert path.read_text(encoding="utf-8") == payload
+
     def test_accounts_file_has_0600_permissions(self, tmp_path):
         registry = make_registry(tmp_path)
         registry.add_account(
@@ -148,3 +165,72 @@ class TestManualAccounts:
         a = registry.add_account(ProviderKind.openai_org, "one", {})
         b = registry.add_account(ProviderKind.openai_org, "two", {})
         assert a.id != b.id
+
+
+class TestUpdateCredentials:
+    NEW_CREDENTIALS = {
+        "access_token": "new-at",
+        "refresh_token": "new-rt",
+        "expires_at": "1893456000000",
+    }
+
+    def test_update_credentials_replaces_and_persists(self, tmp_path):
+        registry = make_registry(tmp_path)
+        account = registry.add_account(
+            ProviderKind.claude_personal,
+            "OAuth Claude",
+            {"access_token": "old-at", "refresh_token": "old-rt", "expires_at": "1"},
+            origin="oauth",
+        )
+
+        registry.update_credentials(account.id, dict(self.NEW_CREDENTIALS))
+
+        config = registry.get_config(account.id)
+        assert config.credentials == self.NEW_CREDENTIALS
+        # Persisted with 0600 and visible to a fresh registry instance.
+        assert (
+            stat.S_IMODE(os.stat(tmp_path / "config" / "accounts.json").st_mode)
+            == 0o600
+        )
+        reloaded = AccountRegistry(
+            config_dir=tmp_path / "config",
+            claude_credentials_path=tmp_path / "home" / ".claude" / ".credentials.json",
+            codex_auth_path=tmp_path / "home" / ".codex" / "auth.json",
+        )
+        stored = reloaded.get_config(account.id)
+        assert stored.credentials == self.NEW_CREDENTIALS
+        assert stored.origin == "oauth"
+
+    def test_update_credentials_preserves_identity_and_siblings(self, tmp_path):
+        registry = make_registry(tmp_path)
+        account = registry.add_account(
+            ProviderKind.claude_personal, "OAuth Claude", {"access_token": "old"}
+        )
+        sibling = registry.add_account(
+            ProviderKind.chatgpt_personal, "OAuth ChatGPT", {"access_token": "sib"}
+        )
+
+        registry.update_credentials(account.id, {"access_token": "new"})
+
+        updated = registry.get_config(account.id)
+        assert (updated.id, updated.label, updated.provider) == (
+            account.id,
+            "OAuth Claude",
+            ProviderKind.claude_personal,
+        )
+        assert updated.credentials == {"access_token": "new"}
+        assert registry.get_config(sibling.id).credentials == {"access_token": "sib"}
+
+    def test_update_credentials_unknown_id_raises_keyerror(self, tmp_path):
+        registry = make_registry(tmp_path)
+        with pytest.raises(KeyError):
+            registry.update_credentials("nope", {"access_token": "x"})
+
+    def test_update_credentials_auto_accounts_raise_keyerror(self, tmp_path):
+        registry = make_registry(tmp_path, claude=True, codex=True)
+        for account_id in (AUTO_CLAUDE_ID, AUTO_CHATGPT_ID):
+            with pytest.raises(KeyError):
+                registry.update_credentials(account_id, {"access_token": "x"})
+        # The CLI-owned login files are never written by the registry:
+        # no accounts.json was created.
+        assert not (tmp_path / "config" / "accounts.json").exists()
