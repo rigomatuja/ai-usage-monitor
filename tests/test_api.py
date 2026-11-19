@@ -207,6 +207,7 @@ def oauth_env(tmp_path):
     listener_handlers = []
 
     async def fake_listener(port, handler):
+        await asyncio.sleep(0)
         listener_handlers.append((port, handler))
         return asyncio.get_running_loop().create_future()
 
@@ -262,18 +263,30 @@ def test_listener_deadline_extend_resets_full_timeout():
 
 
 class TestOAuthLogin:
+    @pytest.mark.parametrize("host, headers", [
+        ("127.0.0.1", {"Origin": "http://foreign.invalid"}),
+        ("localhost", {"Sec-Fetch-Site": "cross-site"}),
+    ])
+    def test_cross_origin_login_preserves_pending(self, oauth_env, host, headers):
+        path = "/api/oauth/claude_personal/login"
+        assert oauth_env.client.post(path, headers={"Origin": f"http://{host}:61524"}).status_code == 200
+        pending = oauth_env.app.state.oauth_pending
+        before = pending["claude_personal"].copy()
+        response = oauth_env.client.post(path, headers=headers)
+        assert (response.status_code, response.json()) == (403, {"detail": "Cross-origin OAuth login denied"})
+        assert len(oauth_env.claude.authorize_calls) == 1
+        assert pending["claude_personal"] == before
+
     def test_claude_login_returns_authorize_url(self, oauth_env):
         response = oauth_env.client.post("/api/oauth/claude_personal/login")
         assert response.status_code == 200
         verifier, state = oauth_env.claude.authorize_calls[0]
         assert verifier and state
-        assert response.json() == {
-            "authorize_url": f"https://auth.example.com/authorize?state={state}"
+        attempt_id = response.json()["attempt_id"]
+        assert attempt_id and response.json()["authorize_url"] == f"https://auth.example.com/authorize?state={state}"
+        assert oauth_env.app.state.oauth_pending["claude_personal"] == {
+            "verifier": verifier, "state": state, "attempt_id": attempt_id,
         }
-        # The pending session stores the exact verifier/state handed to the
-        # oauth client.
-        pending = oauth_env.app.state.oauth_pending["claude_personal"]
-        assert pending == {"verifier": verifier, "state": state}
 
     def test_chatgpt_login_starts_listener_on_injected_port(self, oauth_env):
         response = oauth_env.client.post("/api/oauth/chatgpt_personal/login")
@@ -301,9 +314,23 @@ class TestOAuthLogin:
             response = oauth_env.client.post("/api/oauth/chatgpt_personal/login")
             assert response.status_code == 200
             verifier, state = oauth_env.chatgpt.authorize_calls[-1]
-            assert response.json() == {"authorize_url": f"https://auth.example.com/authorize?state={state}"}
+            assert response.json()["authorize_url"] == f"https://auth.example.com/authorize?state={state}"
         assert len(oauth_env.listener_handlers) == 1
-        assert oauth_env.app.state.oauth_pending["chatgpt_personal"] == {"verifier": verifier, "state": state}
+        pending = oauth_env.app.state.oauth_pending["chatgpt_personal"]
+        assert (pending["verifier"], pending["state"]) == (verifier, state)
+
+    async def test_concurrent_chatgpt_logins(self, oauth_env):
+        app = oauth_env.app
+        completed = []
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            async def login():
+                completed.append(await client.post("/api/oauth/chatgpt_personal/login"))
+
+            await asyncio.gather(login(), login())
+            assert (await client.get(f"/api/oauth/attempts/{completed[0].json()['attempt_id']}")).json() == {"status": "superseded"}
+        assert [response.status_code for response in completed] == [200, 200]
+        assert len(oauth_env.listener_handlers) == 1
+        assert app.state.oauth_pending["chatgpt_personal"]["attempt_id"] == completed[-1].json()["attempt_id"]
 
     def test_chatgpt_relogin_extends_live_listener_deadline(self, oauth_env, monkeypatch):
         from ai_usage_monitor import api
@@ -361,7 +388,12 @@ class TestOAuthLogin:
 
 class TestClaudeCallback:
     def test_happy_path_creates_manual_account_and_polls(self, oauth_env):
-        state = _login_claude(oauth_env)
+        client = oauth_env.client
+        assert client.get("/api/oauth/attempts/unknown").status_code == 404
+        login = client.post("/api/oauth/claude_personal/login")
+        attempt = f"/api/oauth/attempts/{login.json()['attempt_id']}"
+        assert client.get(attempt).json() == {"status": "pending"}
+        state = oauth_env.claude.authorize_calls[0][1]
 
         response = oauth_env.client.get(
             "/api/oauth/claude/callback",
@@ -371,6 +403,7 @@ class TestClaudeCallback:
         assert response.status_code == 200
         assert "text/html" in response.headers["content-type"]
         assert "url=/" in response.text
+        assert client.get(attempt).json() == {"status": "completed"}
         # The oauth client received the pending verifier and state.
         code, verifier, state_arg = oauth_env.claude.exchange_calls[0]
         assert code == "auth-code"

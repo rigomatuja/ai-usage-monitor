@@ -69,6 +69,7 @@ async function main() {
   const popup = { location: {} };
   const popupResult = scenario === "unblocked" ? popup : null;
   let opens = 0;
+  let attemptStatus = "pending";
   const requests = [["GET", "/api/accounts", initial], ["GET", "/api/usage", []]];
   const context = vm.createContext({
     document: {
@@ -84,6 +85,9 @@ async function main() {
       },
     },
     async fetch(url, options) {
+      if (url === `/api/oauth/attempts/attempt-${opens}`) {
+        return { ok: true, json: async () => ({ status: attemptStatus }) };
+      }
       const request = requests.shift();
       assert.ok(request, `Unexpected request: ${url}`);
       const [method, path, body, opened] = request;
@@ -99,7 +103,7 @@ async function main() {
   await new Promise((resolve) => setImmediate(resolve)); // dashboard's initial refresh
 
   function signIn(provider, url, opened) {
-    requests.push(["POST", `/api/oauth/${provider}_personal/login`, { authorize_url: url }, opened]);
+    requests.push(["POST", `/api/oauth/${provider}_personal/login`, { authorize_url: url, attempt_id: `attempt-${opened}` }, opened]);
     return elements.get(provider === "claude" ? "signin-claude" : "signin-chatgpt").click();
   }
 
@@ -142,8 +146,16 @@ async function main() {
       assertLink();
       break;
     case "replacement":
+      attemptStatus = "completed";
       await reload([other, account("oauth-new")]);
       assert.equal(waiting.classList.contains("hidden"), true, "new OAuth account clears status despite removal");
+      break;
+    case "same-provider":
+      await reload([...initial, account("manual-new")]);
+      assertLink();
+      attemptStatus = "completed";
+      await reload([...initial, account("manual-new")]);
+      assert.equal(waiting.classList.contains("hidden"), true);
       break;
     case "dismiss": {
       assertLink();
@@ -163,6 +175,7 @@ async function main() {
       assertLink(chatgptUrl);
       await reload([...initial, account("oauth-claude")]);
       assertLink(chatgptUrl);
+      attemptStatus = "completed";
       await reload([...initial, account("oauth-chatgpt", "chatgpt_personal")]);
       assert.equal(waiting.classList.contains("hidden"), true);
       break;

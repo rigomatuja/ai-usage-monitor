@@ -271,6 +271,20 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
         async with httpx.AsyncClient(timeout=30.0) as owned:
             yield owned
 
+    def _mark_attempt(app, pending, status):
+        attempts = app.state.oauth_attempts
+        if pending and pending.get("attempt_id") in attempts:
+            attempts[pending["attempt_id"]] = status
+
+    @router.get("/api/oauth/attempts/{attempt_id}")
+    async def oauth_attempt(attempt_id: str, request: Request, response: Response) -> dict[str, str]:
+        status = request.app.state.oauth_attempts.get(attempt_id)
+        if status is None:
+            raise HTTPException(status_code=404, detail="unknown oauth attempt")
+        if status == "failed":
+            response.headers["X-OAuth-Error"] = "Sign-in failed. Please try signing in again."
+        return {"status": status}
+
     def _chatgpt_completion(app: FastAPI):
         """Completion callback handed to the temporary listener: validate the
         state, exchange the code, store the account, poll once, and return
@@ -296,6 +310,7 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
                         http, code, pending["verifier"], pending["state"]
                     )
                 except Exception as exc:
+                    _mark_attempt(app, pending, "failed")
                     logger.warning("ChatGPT OAuth code exchange failed", exc_info=True)
                     raise OAuthCallbackError("token exchange failed") from exc
                 credentials = _credential_dict(exchanged)
@@ -311,6 +326,7 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
                     logger.warning(
                         "post-login poll failed for %s", account.id, exc_info=True
                     )
+            _mark_attempt(app, pending, "completed")
             return app.state.app_origin + "/"
 
         return complete
@@ -322,6 +338,15 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
                 status_code=404, detail=f"unknown oauth provider: {provider}"
             )
         app = request.app
+        origins = request.headers.getlist("origin")
+        if any(origin not in (
+            app.state.app_origin, f"http://localhost:{app.state.app_port}",
+        ) for origin in origins) or "cross-site" in request.headers.getlist("sec-fetch-site"):
+            raise HTTPException(status_code=403, detail="Cross-origin OAuth login denied")
+        async with app.state.oauth_login_lock:
+            return await _start_login(app, provider)
+
+    async def _start_login(app: FastAPI, provider: str) -> dict[str, str]:
         client = _oauth_clients(app)[provider]
         verifier = secrets.token_urlsafe(32)
         state = secrets.token_urlsafe(32)
@@ -358,8 +383,14 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
                 deadline = app.state.oauth_listener_deadline
             deadline.extend()
         # ONE pending login session per provider; a new call replaces it.
-        app.state.oauth_pending[provider] = {"verifier": verifier, "state": state}
-        return {"authorize_url": authorize_url}
+        _mark_attempt(app, app.state.oauth_pending.get(provider), "superseded")
+        attempt_id = secrets.token_urlsafe(16)
+        attempts = app.state.oauth_attempts
+        attempts[attempt_id] = "pending"
+        if len(attempts) > 50:
+            attempts.pop(next(iter(attempts)))
+        app.state.oauth_pending[provider] = {"verifier": verifier, "state": state, "attempt_id": attempt_id}
+        return {"authorize_url": authorize_url, "attempt_id": attempt_id}
 
     @router.get("/api/oauth/claude/callback", include_in_schema=False)
     async def claude_oauth_callback(
@@ -387,6 +418,7 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
                 )
             except Exception:
                 # Never a stack trace, never token values.
+                _mark_attempt(app, pending, "failed")
                 logger.warning("Claude OAuth code exchange failed", exc_info=True)
                 return _html_error(
                     "Token exchange failed. Please start the sign-in again."
@@ -404,6 +436,7 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
                 logger.warning(
                     "post-login poll failed for %s", account.id, exc_info=True
                 )
+        _mark_attempt(app, pending, "completed")
         return HTMLResponse(_CALLBACK_SUCCESS_HTML)
 
     return router

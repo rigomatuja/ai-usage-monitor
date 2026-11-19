@@ -228,11 +228,13 @@ let lastUsage = [];
 
 async function loadAccounts() {
   accounts = await getJson("/api/accounts");
-  if (pendingOauth && accounts.some(({ id, provider, source }) =>
-    !pendingOauth.accountIds.has(id) && provider === pendingOauth.provider && source === "manual"
-  )) {
-    clearOauthStatus();
-  }
+  const attempt = pendingOauth;
+  if (!attempt?.id) return;
+  const res = await fetchJson(`/api/oauth/attempts/${encodeURIComponent(attempt.id)}`, { cache: "no-store" }).catch(() => null);
+  const result = res?.ok ? await res.json().catch(() => null) : null;
+  if (pendingOauth !== attempt) return;
+  if (result?.status === "completed") clearOauthStatus();
+  if (result?.status === "failed") showOauthError(res.headers.get("X-OAuth-Error"));
 }
 
 async function loadUsage() {
@@ -324,7 +326,7 @@ async function onAddSubmit(event) {
 
 /* --- OAuth sign in ------------------------------------------------------------ */
 
-// POST /api/oauth/{provider}/login -> 200 {authorize_url}; 404 unknown provider.
+// POST /api/oauth/{provider}/login -> 200 {authorize_url, attempt_id}; 404 unknown provider.
 // The authorize URL comes from the server; app.js never hardcodes one.
 const OAUTH_LOGIN_PATHS = {
   claude_personal: "/api/oauth/claude_personal/login",
@@ -347,7 +349,7 @@ function showOauthError(message) {
 async function startOauthLogin(provider) {
   const tab = window.open("", "_blank");
   clearOauthStatus(); // clicking again resets any previous status
-  const attempt = { provider, accountIds: new Set(accounts.map(({ id }) => id)) };
+  const attempt = {};
   pendingOauth = attempt;
   let res;
   let body = null;
@@ -359,7 +361,6 @@ async function startOauthLogin(provider) {
     if (pendingOauth === attempt) showOauthError("connection lost");
     return;
   }
-  // A newer sign-in or a completed accounts reload may have cleared this attempt.
   if (pendingOauth !== attempt) {
     if (tab) tab.close();
     return;
@@ -374,6 +375,7 @@ async function startOauthLogin(provider) {
     showOauthError("server did not return an authorize URL");
     return;
   }
+  attempt.id = body.attempt_id;
   els.oauthWaiting.textContent = "Waiting for login to complete\u2026";
   if (tab) {
     tab.location.href = body.authorize_url;

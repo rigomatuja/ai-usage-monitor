@@ -42,10 +42,19 @@ def create_app(
             registry, provider_factory=provider_factory, interval=interval
         )
 
+    async def finish_rotations():
+        await poller.drain_rotations(10)
+        unsaved = await poller.flush_unpersisted()
+        if unsaved:
+            logger.error("Rotated credentials unsaved at shutdown for %s", ", ".join(unsaved))
+
     @contextlib.asynccontextmanager
-    async def background(app: FastAPI):
+    async def lifespan(app: FastAPI):
         if not start_background:
-            yield
+            try:
+                yield
+            finally:
+                await finish_rotations()
             return
         async with httpx.AsyncClient(timeout=30.0) as http:
             app.state.http = http
@@ -61,19 +70,10 @@ def create_app(
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
+                await finish_rotations()
                 for task in tasks:
                     with contextlib.suppress(asyncio.CancelledError):
                         task.result()
-
-    @contextlib.asynccontextmanager
-    async def lifespan(app: FastAPI):
-        try:
-            async with background(app):
-                yield
-        finally:
-            unsaved = await poller.flush_unpersisted()
-            if unsaved:
-                logger.error("Rotated credentials unsaved at shutdown for %s", ", ".join(unsaved))
 
     app = FastAPI(title="AI Usage Monitor", lifespan=lifespan)
 
@@ -103,7 +103,10 @@ def create_app(
         }
     app.state.oauth_clients = oauth_clients
     app.state.oauth_pending = {}
+    app.state.oauth_attempts = {}
+    app.state.oauth_login_lock = asyncio.Lock()
     app.state.oauth_callback_port = oauth_callback_port
+    app.state.app_port = app_port
     app.state.app_origin = f"http://127.0.0.1:{app_port}"
     app.include_router(build_router(registry, poller))
     app.include_router(build_oauth_router(listener_factory=oauth_listener_factory))

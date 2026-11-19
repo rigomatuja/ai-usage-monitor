@@ -76,6 +76,7 @@ class UsagePoller:
         self._last_good_windows: dict[str, list[UsageWindow]] = {}
         self._unpersisted: dict[str, dict[str, str]] = {}
         self._poll_locks: dict[str, asyncio.Lock] = {}
+        self._rotations: dict[str, asyncio.Task] = {}
 
     def _persist(self, account_id: str, credentials: dict[str, str]) -> None:
         try:
@@ -102,7 +103,19 @@ class UsagePoller:
                     self._persist(account_id, credentials)
         return list(self._unpersisted)
 
+    async def drain_rotations(self, timeout: float) -> None:
+        if self._rotations:
+            _, pending = await asyncio.wait(tuple(self._rotations.values()), timeout=timeout)
+            if pending:
+                logger.warning("Timed out waiting for %d OAuth rotations", len(pending))
+
     async def _refresh(self, account_id, provider, credentials, http) -> dict[str, str] | None:
+        task = asyncio.create_task(self._rotate(account_id, provider, credentials, http))
+        self._rotations[account_id] = task
+        task.add_done_callback(lambda _: self._rotations.pop(account_id, None))
+        return await asyncio.shield(task)
+
+    async def _rotate(self, account_id, provider, credentials, http) -> dict[str, str] | None:
         try:
             refreshed = await self._refresh_fn(http, provider, credentials)
         except Exception as exc:
@@ -118,6 +131,9 @@ class UsagePoller:
         """Poll one account and store its snapshot. Raises KeyError if the
         account does not exist."""
         async with self._account_lock(account_id):
+            # A cancelled poll may have left its rotation running.
+            if rotation := self._rotations.get(account_id):
+                await asyncio.shield(rotation)
             return await self._poll_account(account_id, http)
 
     async def _poll_account(self, account_id: str, http: httpx.AsyncClient) -> UsageSnapshot:

@@ -213,6 +213,29 @@ class TestPrefetchRefresh:
         refresh.assert_awaited_once_with(http, ProviderKind.claude_personal, self.OLD_CREDENTIALS)
         assert [snapshot.status for snapshot in snapshots] == ["ok", "ok"]
 
+    async def test_cancelled_poll_drains_rotation(self, setup, http):
+        registry, _ = setup
+        account = self._add_oauth_account(registry)
+        started, release = asyncio.Future(), asyncio.Event()
+
+        async def rotate(*args):
+            started.set_result(asyncio.current_task())
+            await release.wait()
+            return self.ROTATED
+
+        refresh = AsyncMock(side_effect=rotate)
+        poller = UsagePoller(registry, lambda c: FakeProvider(c.credentials), refresh_fn=refresh)
+        poll = asyncio.create_task(poller.poll_account(account.id, http))
+        rotation = await asyncio.wait_for(started, 1)
+        poll.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await poll
+        release.set()
+        assert not rotation.done()
+        await poller.drain_rotations(1)
+        assert registry.get_config(account.id).credentials == dict(self.ROTATED, expires_at="1893456000000")
+        refresh.assert_awaited_once_with(http, ProviderKind.claude_personal, self.OLD_CREDENTIALS)
+
     @pytest.mark.parametrize("persist_fails", [False, True])
     async def test_flush_unpersisted_retries_without_refresh(self, setup, http, monkeypatch, persist_fails):
         registry, _ = setup
@@ -462,6 +485,7 @@ class TestPrefetchRefresh:
                 order.append("retry cancelled")
 
         async def flush():
+            assert not app.state.http.is_closed
             order.append("final flush")
             return ["unsaved-account"]
 
