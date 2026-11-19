@@ -154,7 +154,18 @@ class ClaudePersonalProvider(UsageProvider):
                 continue
             label = _WINDOW_KINDS[kind]
             if limit_kind == "weekly_scoped":
-                model = entry.get("model") or entry.get("model_display_name")
+                # Live shape: scope.model.display_name (verified 2026-11);
+                # top-level keys kept as a tolerant fallback.
+                scope = entry.get("scope")
+                scope_model = scope.get("model") if isinstance(scope, dict) else None
+                if not isinstance(scope_model, dict):
+                    scope_model = {}
+                model = (
+                    scope_model.get("display_name")
+                    or scope_model.get("id")
+                    or entry.get("model")
+                    or entry.get("model_display_name")
+                )
                 if isinstance(model, str) and model:
                     label = f"{label} · {model}"
             windows.append(

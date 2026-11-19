@@ -64,8 +64,10 @@ def test_index_html_has_required_hooks(index_html: str, dom_id: str):
 
 
 def test_index_html_loads_local_assets_only(index_html: str):
-    assert 'src="app.js"' in index_html
-    assert 'href="styles.css"' in index_html
+    # Absolute /static/ paths: the page is served at "/", where relative
+    # "app.js"/"styles.css" would resolve to unserved URLs.
+    assert 'src="/static/app.js"' in index_html
+    assert 'href="/static/styles.css"' in index_html
 
 
 def test_index_html_documents_credential_keys(index_html: str):
