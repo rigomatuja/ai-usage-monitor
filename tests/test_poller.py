@@ -232,9 +232,13 @@ class TestPrefetchRefresh:
             await poll
         release.set()
         assert not rotation.done()
-        await poller.drain_rotations(1)
+        await poller.drain_rotations()
         assert registry.get_config(account.id).credentials == dict(self.ROTATED, expires_at="1893456000000")
         refresh.assert_awaited_once_with(http, ProviderKind.claude_personal, self.OLD_CREDENTIALS)
+
+    async def test_drain_without_rotations_returns_promptly(self, setup):
+        _, poller = setup
+        await asyncio.wait_for(poller.drain_rotations(), 1)
 
     @pytest.mark.parametrize("persist_fails", [False, True])
     async def test_flush_unpersisted_retries_without_refresh(self, setup, http, monkeypatch, persist_fails):
@@ -485,6 +489,7 @@ class TestPrefetchRefresh:
                 order.append("retry cancelled")
 
         async def flush():
+            drain.assert_awaited_once_with()
             assert not app.state.http.is_closed
             order.append("final flush")
             return ["unsaved-account"]
@@ -501,19 +506,18 @@ class TestPrefetchRefresh:
 
         assert order == ["retry started", "retry cancelled", "final flush"]
         assert caplog.messages == ["Rotated credentials unsaved at shutdown for unsaved-account"]
-        drain.assert_awaited_once()
-        assert drain.await_args.args[0] >= app.state.http.timeout.read
+        drain.assert_awaited_once_with()
 
-    async def test_shutdown_persists_rotation_slower_than_ten_seconds(self, setup, monkeypatch, tmp_path):
+    async def test_shutdown_persists_rotation_slower_than_old_drain(self, setup, monkeypatch, tmp_path):
         registry, _ = setup
         started = asyncio.Future()
         draining = asyncio.Event()
-        scale = 0.01
+        scale = 0.001
 
         async def rotate(http, *_):
             started.set_result(asyncio.current_task())
             await draining.wait()
-            await asyncio.sleep(12 * scale)
+            await asyncio.sleep(50 * scale)  # longer than the old 35 * scale drain
             assert not http.is_closed
             return self.ROTATED
 
@@ -521,9 +525,9 @@ class TestPrefetchRefresh:
                              refresh_fn=rotate)
         drain = poller.drain_rotations
 
-        async def scaled_drain(timeout):
+        async def scaled_drain(*timeouts):
             draining.set()
-            await drain(timeout * scale)
+            await drain(*(timeout * scale for timeout in timeouts))
 
         monkeypatch.setattr(poller, "drain_rotations", scaled_drain)
         app = create_app(registry=registry, poller=poller)
@@ -545,13 +549,20 @@ class TestPrefetchRefresh:
                 rotation.cancel()
                 await asyncio.gather(rotation, return_exceptions=True)
 
+    @pytest.mark.parametrize("hang", [False, True], ids=["rejected", "deadline"])
     async def test_refresh_failure_proceeds_with_existing_token(
-        self, setup, http, fake_windows, caplog
+        self, setup, http, fake_windows, caplog, hang
     ):
         registry, _ = setup
         account = self._add_oauth_account(registry)
+        cancelled = asyncio.Event()
 
         async def refresh(http_arg, provider, credentials):
+            if hang:
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
             raise OAuthError("refresh rejected by provider")
 
         seen = []
@@ -565,10 +576,12 @@ class TestPrefetchRefresh:
             provider_factory=factory,
             refresh_fn=refresh,
             should_refresh=lambda credentials: True,
+            refresh_deadline=0.01,
         )
 
         with caplog.at_level(logging.WARNING):
-            snapshot = await poller.poll_account(account.id, http)
+            snapshot = await asyncio.wait_for(poller.poll_account(account.id, http), 0.2)
+        assert cancelled.is_set() == hang
 
         # Fetch still happened, with the existing access token.
         assert snapshot.status == "ok"

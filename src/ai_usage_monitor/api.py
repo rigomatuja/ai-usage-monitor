@@ -134,7 +134,7 @@ async def _start_chatgpt_listener(
             except Exception as exc:
                 session_consumed = not isinstance(exc, _UnconsumedOAuthCallbackError)
                 # Never a stack trace, never token values.
-                logger.warning("ChatGPT OAuth callback failed", exc_info=True)
+                logger.warning("ChatGPT OAuth callback failed")
                 payload = _CALLBACK_ERROR_HTML.format(
                     message="Sign-in failed. Please try signing in again."
                 ).encode("utf-8")
@@ -315,37 +315,37 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
             response.headers["X-OAuth-Error"] = _ATTEMPT_ERRORS[status]
         return {"status": status}
 
-    def _chatgpt_completion(app: FastAPI):
-        """Completion callback handed to the temporary listener: validate the
-        state, exchange the code, store the account, poll once, and return
-        the redirect target for the browser (the app origin)."""
-
-        async def complete(code: str | None, state: str | None) -> str:
-            pending = _consume_pending(app, _CHATGPT, code, state)
-            client = _oauth_clients(app)[_CHATGPT]
+    async def _complete_sign_in(
+        app: FastAPI, provider: str, label: str, code: str | None, state: str | None
+    ) -> None:
+        pending = _consume_pending(app, provider, code, state)
+        message = "Token exchange failed. Please start the sign-in again."
+        stored = False
+        try:
             async with _http_for(app) as http:
-                try:
-                    exchanged = await client.exchange_code(
-                        http, code, pending["verifier"], state
-                    )
-                except Exception as exc:
-                    _mark_attempt(app, pending, "failed")
-                    logger.warning("ChatGPT OAuth code exchange failed", exc_info=True)
-                    raise OAuthCallbackError("token exchange failed") from exc
+                client = _oauth_clients(app)[provider]
+                exchanged = await client.exchange_code(http, code, pending["verifier"], state)
+                message = _ATTEMPT_ERRORS["failed"]
                 credentials = _credential_dict(exchanged)
                 account = app.state.registry.add_account(
-                    ProviderKind.chatgpt_personal,
-                    credentials.get("email") or "ChatGPT OAuth",
-                    credentials,
+                    ProviderKind(provider), credentials.get("email") or label, credentials,
                     origin="oauth",
                 )
-                try:  # poll once; non-fatal
-                    await app.state.poller.poll_account(account.id, http)
-                except Exception:
-                    logger.warning(
-                        "post-login poll failed for %s", account.id, exc_info=True
-                    )
-            _mark_attempt(app, pending, "completed")
+                stored = True
+                _mark_attempt(app, pending, "completed")
+                await app.state.poller.poll_account(account.id, http)
+        except Exception:
+            if not stored:
+                logger.warning("%s OAuth callback: %s", provider, message)
+                raise OAuthCallbackError(message) from None
+            logger.warning("post-login poll or HTTP cleanup failed for %s", account.id)
+        finally:
+            if not stored:
+                _mark_attempt(app, pending, "failed")
+
+    def _chatgpt_completion(app: FastAPI):
+        async def complete(code: str | None, state: str | None) -> str:
+            await _complete_sign_in(app, _CHATGPT, "ChatGPT OAuth", code, state)
             return app.state.app_origin + "/"
 
         return complete
@@ -422,36 +422,11 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
         if code and "#" in code and not state:
             code, _, state = code.partition("#")
         try:
-            pending = _consume_pending(app, _CLAUDE, code, state)
+            await _complete_sign_in(app, _CLAUDE, "Claude OAuth", code, state)
         except _UnconsumedOAuthCallbackError:
             return _html_error("Invalid or expired sign-in state.")
-        client = _oauth_clients(app)[_CLAUDE]
-        async with _http_for(app) as http:
-            try:
-                exchanged = await client.exchange_code(
-                    http, code, pending["verifier"], state
-                )
-            except Exception:
-                # Never a stack trace, never token values.
-                _mark_attempt(app, pending, "failed")
-                logger.warning("Claude OAuth code exchange failed", exc_info=True)
-                return _html_error(
-                    "Token exchange failed. Please start the sign-in again."
-                )
-            credentials = _credential_dict(exchanged)
-            account = app.state.registry.add_account(
-                ProviderKind.claude_personal,
-                credentials.get("email") or "Claude OAuth",
-                credentials,
-                origin="oauth",
-            )
-            try:  # poll once; non-fatal
-                await app.state.poller.poll_account(account.id, http)
-            except Exception:
-                logger.warning(
-                    "post-login poll failed for %s", account.id, exc_info=True
-                )
-        _mark_attempt(app, pending, "completed")
+        except OAuthCallbackError as exc:
+            return _html_error(str(exc))
         return HTMLResponse(_CALLBACK_SUCCESS_HTML)
 
     return router

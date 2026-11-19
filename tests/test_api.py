@@ -524,6 +524,34 @@ class TestClaudeCallback:
         assert oauth_env.claude.exchange_calls == []
         assert client.get("/api/oauth/claude/callback", params={"code": "auth-code", "state": _state(second)}).status_code == 200
 
+    @pytest.mark.parametrize("fail_at", ["store", "poll"])
+    async def test_storage_failure_is_terminal_but_poll_failure_is_nonfatal(self, oauth_env, monkeypatch, fail_at):
+        def fail(*args, **kwargs):
+            raise OSError("disk failure: sk-ant-oat01-t")
+
+        async def fail_poll(*args):
+            fail()
+
+        if fail_at == "store":
+            monkeypatch.setattr(oauth_env.registry, "add_account", fail)
+        else:
+            monkeypatch.setattr(oauth_env.app.state.poller, "poll_account", fail_poll)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=oauth_env.app, raise_app_exceptions=False),
+                                     base_url="http://test", headers=DASHBOARD_HEADERS) as client:
+            login = await client.post("/api/oauth/claude_personal/login")
+            response = await client.get("/api/oauth/claude/callback", params={"code": "auth-code", "state": _state(login)})
+            assert len(oauth_env.claude.exchange_calls) == 1
+            attempt = (await client.get(_attempt(login))).json()
+            accounts = (await client.get("/api/accounts")).json()
+        assert response.headers["content-type"] == "text/html; charset=utf-8"
+        if fail_at == "store":
+            assert (response.status_code, attempt, accounts) == (400, {"status": "failed"}, [])
+            assert "Sign-in failed. Please try signing in again." in response.text
+            assert all(s not in response.text for s in ("sk-ant-oat01-t", "disk failure", "Traceback"))
+        else:
+            assert (response.status_code, attempt) == (200, {"status": "completed"})
+            assert [a["label"] for a in accounts] == ["user@example.com"]
+
     def test_exchange_failure_is_400_html_without_tokens(self, oauth_env):
         state = _login_claude(oauth_env)
         oauth_env.claude.fail_exchange = True
@@ -539,9 +567,9 @@ class TestClaudeCallback:
         assert len(oauth_env.registry.list_infos()) == 0
 
 
-@pytest.mark.parametrize("fail_exchange", [False, True])
+@pytest.mark.parametrize("fail_at", [None, "exchange", "store", "poll"])
 async def test_chatgpt_listener_serves_both_attempts_and_rejects_unknown_state(
-    oauth_env, monkeypatch, fail_exchange
+    oauth_env, monkeypatch, fail_at
 ):
     from ai_usage_monitor.app import create_app
 
@@ -584,17 +612,29 @@ async def test_chatgpt_listener_serves_both_attempts_and_rejects_unknown_state(
             assert not task.done()
             redirect = (b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:61524/\r\n"
                         b"Content-Length: 0\r\nConnection: close\r\n\r\n")
-            oauth_env.chatgpt.fail_exchange = fail_exchange
-            assert await callback(_state(first)) == (rejected if fail_exchange else redirect)
-            assert (await client.get(_attempt(first))).json() == {"status": "failed" if fail_exchange else "completed"}
+            def fail(*args, **kwargs):
+                raise OSError("disk failure: chatgpt-token")
+
+            async def fail_poll(*args):
+                fail()
+
+            failed = fail_at in ("exchange", "store")
+            with monkeypatch.context() as patch:
+                patch.setattr(oauth_env.chatgpt, "fail_exchange", fail_at == "exchange")
+                if fail_at == "store":
+                    patch.setattr(oauth_env.registry, "add_account", fail)
+                elif fail_at == "poll":
+                    patch.setattr(app.state.poller, "poll_account", fail_poll)
+                assert await callback(_state(first)) == (rejected if failed else redirect)
+            assert b"Content-Type: text/html" in rejected and b"chatgpt-token" not in rejected
+            assert (await client.get(_attempt(first))).json() == {"status": "failed" if failed else "completed"}
             assert (await client.get(_attempt(second))).json() == {"status": "pending"}
             assert not task.done()
-            assert len((await client.get("/api/accounts")).json()) == (0 if fail_exchange else 1)
-            oauth_env.chatgpt.fail_exchange = False
+            assert len((await client.get("/api/accounts")).json()) == (0 if failed else 1)
             assert await callback(_state(second)) == redirect
             await asyncio.wait_for(asyncio.shield(task), 2)
             assert (await client.get(_attempt(second))).json() == {"status": "completed"}
-            assert len((await client.get("/api/accounts")).json()) == (1 if fail_exchange else 2)
+            assert len((await client.get("/api/accounts")).json()) == (1 if failed else 2)
             assert oauth_env.chatgpt.exchange_calls == [
                 ("auth-code", verifier, state) for verifier, state in oauth_env.chatgpt.authorize_calls
             ]

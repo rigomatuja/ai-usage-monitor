@@ -43,7 +43,7 @@ def create_app(
         )
 
     async def finish_rotations():
-        await poller.drain_rotations(HTTP_TIMEOUT_SECONDS + 5)
+        await poller.drain_rotations()
         unsaved = await poller.flush_unpersisted()
         if unsaved:
             logger.error("Rotated credentials unsaved at shutdown for %s", ", ".join(unsaved))
