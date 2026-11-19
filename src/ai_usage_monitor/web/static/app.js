@@ -1,8 +1,9 @@
 /* AI Usage Monitor dashboard (T6, S4) — vanilla ES2020, no frameworks.
  * Built against the REST contract:
- *   GET    /api/accounts                  -> [{id, label, provider, platform, source}]
+ *   GET    /api/accounts                  -> [{id, label, default_label, custom_label, provider, platform, source}]
  *   GET    /api/usage                     -> [{account_id, fetched_at, status, error, windows}]
- *   POST   /api/accounts                  {provider, label, credentials} -> AccountInfo
+ *   POST   /api/accounts                  {provider, label?, credentials} -> AccountInfo
+ *   PATCH  /api/accounts/{id}             {label: string | null} -> AccountInfo
  *   DELETE /api/accounts/{id}             -> 204 (409 for auto accounts)
  *   POST   /api/usage/refresh/{id}        -> UsageSnapshot
  * Credentials are sent to the server only; they are never rendered back.
@@ -92,8 +93,17 @@ async function postJson(url, body) {
 
 /* --- time formatting -------------------------------------------------------- */
 
-function fmtLocalTime(iso) {
-  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+const localDateTime = new Intl.DateTimeFormat(undefined, {
+  weekday: "short", day: "numeric", month: "short",
+  hour: "2-digit", minute: "2-digit", timeZoneName: "short",
+});
+
+function fmtLocalDateTime(iso) {
+  const parts = localDateTime.formatToParts(new Date(iso));
+  const { weekday, day, month, hour, minute, dayPeriod, timeZoneName } =
+    Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+  const time = `${hour}:${minute}${dayPeriod ? ` ${dayPeriod}` : ""}`;
+  return `${weekday} ${day} ${month}, ${time} ${timeZoneName}`;
 }
 
 function fmtRelativeAge(iso) {
@@ -109,16 +119,14 @@ function fmtRelativeAge(iso) {
 }
 
 function fmtResets(iso) {
-  const target = new Date(iso).getTime();
-  const diffMs = target - Date.now();
-  if (diffMs <= 0) return "reset";
+  const absolute = `resets ${fmtLocalDateTime(iso)}`;
+  const diffMs = new Date(iso).getTime() - Date.now();
+  if (diffMs <= 0) return absolute;
   const mins = Math.floor(diffMs / 60000);
-  if (mins < 24 * 60) {
-    const h = Math.floor(mins / 60);
-    const m = mins % 60;
-    return m ? `resets in ${h}h ${m}m` : `resets in ${m}m`;
-  }
-  return `resets at ${fmtLocalTime(iso)}`;
+  const hours = Math.floor(mins / 60);
+  const relative = hours >= 24 ? `${Math.floor(hours / 24)}d ${hours % 24}h`
+    : hours ? `${hours}h ${mins % 60}m` : `${mins}m`;
+  return `${absolute} · in ${relative}`;
 }
 
 /* --- rendering -------------------------------------------------------------- */
@@ -137,11 +145,13 @@ function fillClassForPercent(pct) {
 }
 
 function renderWindow(win) {
+  const reset = win.resets_at ? el("div", "window-reset", fmtResets(win.resets_at)) : null;
   if (win.used_percent === null || win.used_percent === undefined) {
     // org daily token/cost buckets: plain stat line, no bar
     const line = el("div", "stat-line");
     line.append(el("span", "window-label", win.label));
     line.append(el("span", "window-detail", win.detail || ""));
+    if (reset) line.append(reset);
     return line;
   }
   const box = el("div", "window");
@@ -157,7 +167,7 @@ function renderWindow(win) {
   bar.append(fill);
   box.append(head, bar);
   if (win.detail) box.append(el("div", "window-detail", win.detail));
-  if (win.resets_at) box.append(el("div", "window-reset", fmtResets(win.resets_at)));
+  if (reset) box.append(reset);
   return box;
 }
 
@@ -171,41 +181,59 @@ function renderCard(account, snapshot) {
   head.append(el("span", "source-badge", account.source));
   head.append(el("span", "provider-kind", account.provider));
   card.append(head);
+  if (account.custom_label) {
+    card.append(el("div", "card-default-label", `${account.provider} · ${account.default_label}`));
+  }
 
+  const usage = el("div", "card-usage");
+  renderCardUsage(usage, snapshot);
+  card.append(usage);
+
+  const footer = el("div", "card-footer");
+  const renameBtn = el("button", "rename-btn", "Rename");
+  renameBtn.type = "button";
+  renameBtn.addEventListener("click", () => openRenameEditor(account, footer, renameBtn));
+  footer.append(renameBtn);
+  if (account.source === "manual") {
+    const removeBtn = el("button", "remove-btn", "Remove");
+    removeBtn.type = "button";
+    removeBtn.addEventListener("click", () => removeAccount(account.id, card));
+    footer.append(removeBtn);
+  }
+  card.append(footer);
+
+  return card;
+}
+
+function renderCardUsage(usage, snapshot) {
   const status = el("div", "card-status");
   if (snapshot && snapshot.status === "error") {
     status.classList.add("error");
     status.textContent = `error: ${snapshot.error || "unknown error"}`;
   } else if (snapshot && snapshot.fetched_at) {
     status.classList.add("ok");
-    status.textContent = `ok · updated ${fmtRelativeAge(snapshot.fetched_at)}`;
+    status.textContent = "ok";
   } else {
     status.classList.add("ok");
     status.textContent = "no usage data yet";
   }
-  card.append(status);
+  if (snapshot?.fetched_at) {
+    const fetchedAt = snapshot.fetched_at;
+    status.textContent += ` · updated ${fmtRelativeAge(fetchedAt)} · ${fmtLocalDateTime(fetchedAt)}`;
+  }
+  usage.replaceChildren(status);
 
   if (snapshot && snapshot.windows && snapshot.windows.length) {
     const stale = snapshot.status === "error";
     const windows = el("div", stale ? "windows stale" : "windows");
     for (const win of snapshot.windows) windows.append(renderWindow(win));
-    if (stale) {
-      const tag = el("span", "stale-tag", "stale");
-      card.querySelector(".card-status").append(tag);
-    }
-    card.append(windows);
+    if (stale) status.append(el("span", "stale-tag", "stale"));
+    usage.append(windows);
   }
+}
 
-  if (account.source === "manual") {
-    const footer = el("div", "card-footer");
-    const removeBtn = el("button", "remove-btn", "Remove");
-    removeBtn.type = "button";
-    removeBtn.addEventListener("click", () => removeAccount(account.id, card));
-    footer.append(removeBtn);
-    card.append(footer);
-  }
-
-  return card;
+function snapshotsByAccount() {
+  return new Map(lastUsage.map((snap) => [snap.account_id, snap]));
 }
 
 function renderAll() {
@@ -214,9 +242,7 @@ function renderAll() {
     els.cards.append(el("div", "empty-state", "No accounts configured yet. Add one below."));
     return;
   }
-  const snapshots = new Map(
-    (lastUsage || []).map((snap) => [snap.account_id, snap])
-  );
+  const snapshots = snapshotsByAccount();
   for (const account of accounts) {
     els.cards.append(renderCard(account, snapshots.get(account.id) || null));
   }
@@ -267,6 +293,73 @@ async function onRefreshClick() {
   }
 }
 
+function openRenameEditor(account, footer, renameBtn) {
+  const editor = el("div", "rename-editor");
+  const input = el("input");
+  input.type = "text";
+  input.setAttribute("aria-label", "Account label");
+  input.value = account.label;
+  editor.append(input);
+
+  let saving = false;
+  const close = () => {
+    if (saving) return;
+    editor.remove();
+    renameBtn.hidden = false;
+    renameBtn.focus();
+  };
+  const buttons = [];
+  const addButton = (text, action) => {
+    const button = el("button", "rename-btn", text);
+    button.type = "button";
+    button.addEventListener("click", action);
+    buttons.push(button);
+    editor.append(button);
+  };
+  const save = async (label) => {
+    if (saving) return;
+    saving = input.disabled = true;
+    for (const button of buttons) button.disabled = true;
+    try {
+      const res = await fetchJson(`/api/accounts/${encodeURIComponent(account.id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ label }),
+      });
+      if (!res.ok) {
+        showCardError(editor, serverErrorMessage(res, await res.json().catch(() => null)));
+        return;
+      }
+      await loadAccounts();
+      renderAll();
+    } catch (err) {
+      showCardError(editor, connectionLost ? "connection lost" : err.message);
+    } finally {
+      saving = input.disabled = false;
+      for (const button of buttons) button.disabled = false;
+      if (editor.isConnected) input.focus();
+    }
+  };
+  const saveInput = () => save(input.value.trim() || null);
+  addButton("Save", saveInput);
+  addButton("Cancel", close);
+  if (account.custom_label) addButton("Reset to default", () => save(null));
+  editor.addEventListener("keydown", (event) => {
+    if (event.isComposing) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      close();
+    } else if (event.key === "Enter" && event.target === input) {
+      event.preventDefault();
+      return saveInput();
+    }
+  });
+
+  renameBtn.hidden = true;
+  footer.append(editor);
+  input.focus();
+}
+
 async function removeAccount(id, card) {
   let res;
   try {
@@ -312,9 +405,10 @@ async function onAddSubmit(event) {
   els.formError.classList.add("hidden");
   const payload = {
     provider: els.provider.value,
-    label: els.label.value.trim(),
     credentials: parseCredentials(els.credentials.value),
   };
+  const label = els.label.value.trim();
+  if (label) payload.label = label;
   try {
     await postJson("/api/accounts", payload);
   } catch (err) {
@@ -406,6 +500,17 @@ els.signinChatgpt.addEventListener("click", () => startOauthLogin("chatgpt_perso
 refreshAll().catch((err) => console.error("initial load failed:", err));
 setInterval(() => {
   loadUsage()
-    .then(renderAll)
+    .then(() => {
+      if (!els.cards.children.length) {
+        renderAll();
+        return;
+      }
+      // Refresh usage without replacing the card controls or an open editor.
+      const snapshots = snapshotsByAccount();
+      for (const card of els.cards.children) {
+        const usage = card.querySelector(".card-usage");
+        if (usage) renderCardUsage(usage, snapshots.get(card.dataset.accountId) || null);
+      }
+    })
     .catch((err) => console.error("usage poll failed:", err));
 }, POLL_INTERVAL_MS);

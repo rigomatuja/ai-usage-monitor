@@ -7,8 +7,8 @@ Rules (odd/tasks/v1-web-monitor.md):
 - Never refresh tokens and never write to the credentials file: the Claude CLI
   owns the refresh flow, and racing it desynchronizes the CLI.
 - Percent values from the endpoint are already 0-100; never rescale.
-- Absent/unknown fields degrade to omitted windows, never errors; errors are
-  raised as ``ProviderError`` only when the account cannot be polled at all.
+- Absent/unknown fields degrade to omitted windows, except that an unreported
+  session is shown as inactive. ``ProviderError`` means polling failed.
 """
 
 from __future__ import annotations
@@ -135,8 +135,24 @@ class ClaudePersonalProvider(UsageProvider):
     ) -> list[UsageWindow]:
         limits = payload.get("limits")
         if isinstance(limits, list) and limits:
-            return self._parse_limits(limits, subscription_type)
-        return self._parse_top_level(payload, subscription_type)
+            windows = self._parse_limits(limits, subscription_type)
+        else:
+            weekly = self._parse_top_level_window(
+                payload.get("seven_day"), WindowKind.weekly, subscription_type
+            )
+            windows = [weekly] if weekly is not None else []
+
+        kind = WindowKind.five_hour
+        if any(window.kind == kind for window in windows):
+            return sorted(windows, key=lambda window: window.kind != kind)
+
+        session = self._parse_top_level_window(payload.get("five_hour"), kind, subscription_type)
+        if session is None:
+            detail = "No active session"
+            if subscription_type:
+                detail = f"{subscription_type} · {detail}"
+            session = UsageWindow(kind=kind, label=_WINDOW_KINDS[kind], used_percent=0.0, detail=detail)
+        return [session, *windows]
 
     def _parse_limits(
         self, limits: list[Any], subscription_type: str | None
@@ -179,27 +195,18 @@ class ClaudePersonalProvider(UsageProvider):
             )
         return windows
 
-    def _parse_top_level(
-        self, payload: dict[str, Any], subscription_type: str | None
-    ) -> list[UsageWindow]:
-        windows: list[UsageWindow] = []
-        for key, kind in (
-            ("five_hour", WindowKind.five_hour),
-            ("seven_day", WindowKind.weekly),
-        ):
-            entry = payload.get(key)
-            if not isinstance(entry, dict):
-                continue
-            utilization = entry.get("utilization")
-            if not _is_number(utilization):
-                continue
-            windows.append(
-                UsageWindow(
-                    kind=kind,
-                    label=_WINDOW_KINDS[kind],
-                    used_percent=float(utilization),
-                    detail=subscription_type,
-                    resets_at=_parse_resets_at(entry.get("resets_at")),
-                )
-            )
-        return windows
+    def _parse_top_level_window(
+        self, entry: Any, kind: WindowKind, subscription_type: str | None
+    ) -> UsageWindow | None:
+        if not isinstance(entry, dict):
+            return None
+        utilization = entry.get("utilization")
+        if not _is_number(utilization):
+            return None
+        return UsageWindow(
+            kind=kind,
+            label=_WINDOW_KINDS[kind],
+            used_percent=float(utilization),
+            detail=subscription_type,
+            resets_at=_parse_resets_at(entry.get("resets_at")),
+        )

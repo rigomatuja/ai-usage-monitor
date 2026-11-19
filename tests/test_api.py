@@ -4,6 +4,10 @@ frontend side of the same contract)."""
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
+import os
+from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
@@ -34,7 +38,7 @@ class FakeProvider:
 
 
 @pytest.fixture
-def client(tmp_path):
+def accounts_app(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
     (home / ".codex").mkdir()
@@ -49,12 +53,121 @@ def client(tmp_path):
     )
     from ai_usage_monitor.app import create_app
 
-    app = create_app(registry=registry, poller=poller, start_background=False)
-    with TestClient(app) as test_client:
+    return create_app(registry=registry, poller=poller, start_background=False)
+
+
+@pytest.fixture
+def client(accounts_app):
+    with TestClient(accounts_app) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def non_raising_client(accounts_app):
+    with TestClient(accounts_app, raise_server_exceptions=False) as test_client:
         yield test_client
 
 
 class TestAccountsEndpoints:
+    @pytest.mark.parametrize("failure, warning_class", [
+        ("accounts-replace", None),
+        ("labels-read", "PermissionError"),
+        ("labels-parse", "JSONDecodeError"),
+        ("labels-shape", "ValueError"),
+        ("labels-replace", "OSError"),
+    ])
+    def test_delete_preserves_both_files_on_store_failure(
+        self, non_raising_client, tmp_path, monkeypatch, caplog, failure, warning_class,
+    ):
+        client = non_raising_client
+        added = client.post(
+            "/api/accounts",
+            json={"provider": "openai_org", "credentials": {"api_key": "synthetic"}},
+        )
+        assert added.status_code == 201
+        account_id = added.json()["id"]
+        path = f"/api/accounts/{account_id}"
+        accounts = tmp_path / "config" / "accounts.json"
+        labels = accounts.with_name("labels.json")
+        if failure == "labels-parse":
+            labels_before = b'{"incomplete":'
+        elif failure == "labels-shape":
+            labels_before = b'[]'
+        else:
+            labels_before = ('{\r\n  "%s": "Café"\r\n}\r\n' % account_id).encode("utf-8")
+        labels.write_bytes(labels_before)
+        accounts_before = accounts.read_bytes()
+        listing_before = client.get("/api/accounts").json()
+        usage_before = client.get("/api/usage").json()
+
+        read_text, replace = Path.read_text, os.replace
+        store_events = []
+
+        def checked_read(file, *args, **kwargs):
+            if file == labels:
+                store_events.append("labels-read")
+                if failure == "labels-read":
+                    raise PermissionError("label store unreadable")
+            return read_text(file, *args, **kwargs)
+
+        def checked_replace(source, target):
+            if target in (accounts, labels):
+                event = f"{target.stem}-replace"
+                store_events.append(event)
+                if event == failure:
+                    raise OSError("replacement failed")
+            return replace(source, target)
+
+        with monkeypatch.context() as faults:
+            faults.setattr(Path, "read_text", checked_read)
+            faults.setattr(os, "replace", checked_replace)
+            result = client.delete(path)
+
+        assert labels.read_bytes() == labels_before
+        warnings = [record for record in caplog.records if record.name == "ai_usage_monitor.registry"]
+        listing = client.get("/api/accounts")
+        if failure == "accounts-replace":
+            assert (result.status_code, result.text) == (500, "Internal Server Error")
+            assert store_events == ["accounts-replace"]
+            assert accounts.read_bytes() == accounts_before
+            assert (listing.status_code, listing.json()) == (200, listing_before)
+            assert client.get("/api/usage").json() == usage_before
+            assert warnings == []
+            return
+
+        assert (result.status_code, result.content) == (204, b"")
+        assert store_events == ["accounts-replace", "labels-read"] + (
+            ["labels-replace"] if failure == "labels-replace" else []
+        )
+        assert json.loads(accounts.read_bytes()) == []
+        other = listing_before[0]
+        assert (listing.status_code, listing.json()) == (200, [other])
+        assert client.get("/api/usage").json() == []
+        assert [(r.levelno, r.getMessage(), r.exc_info) for r in warnings] == [
+            (logging.WARNING, f"Could not clean up account labels ({warning_class})", None),
+        ]
+        if failure == "labels-read":
+            renamed = client.patch(
+                f"/api/accounts/{other['id']}", json={"label": "Other"}, headers=DASHBOARD_HEADERS,
+            )
+            assert (renamed.status_code, renamed.json()) == (
+                200, {**other, "label": "Other", "custom_label": True},
+            )
+            assert json.loads(labels.read_bytes()) == {other["id"]: "Other"}
+
+    def test_list_accounts_ignores_orphan_labels(self, client, tmp_path):
+        before = client.get("/api/accounts").json()
+        config = tmp_path / "config"
+        config.mkdir()
+        labels = config / "labels.json"
+        orphaned = b'{"openai_org-deadbeef":"Old org","auto-claude-personal":"Old login"}'
+        labels.write_bytes(orphaned)
+
+        listing = client.get("/api/accounts")
+
+        assert (listing.status_code, listing.json()) == (200, before)
+        assert labels.read_bytes() == orphaned
+
     def test_list_accounts_includes_auto(self, client):
         response = client.get("/api/accounts")
         assert response.status_code == 200
@@ -64,12 +177,13 @@ class TestAccountsEndpoints:
         assert accounts[0]["platform"] == "openai"
         assert accounts[0]["provider"] == "chatgpt_personal"
 
-    def test_add_manual_account(self, client):
+    @pytest.mark.parametrize("label", ["Work org", "é" * 80])
+    def test_add_manual_account(self, client, label):
         response = client.post(
             "/api/accounts",
             json={
                 "provider": "anthropic_org",
-                "label": "Work org",
+                "label": f" {label} ",
                 "credentials": {"api_key": "sk-ant-admin-x"},
             },
         )
@@ -78,8 +192,10 @@ class TestAccountsEndpoints:
         assert body["source"] == "manual"
         assert body["platform"] == "claude"
         assert body["provider"] == "anthropic_org"
+        assert body["label"] == body["default_label"] == label
+        assert body["custom_label"] is False
         # The new account is listed and was polled immediately.
-        assert any(a["id"] == body["id"] for a in client.get("/api/accounts").json())
+        assert body in client.get("/api/accounts").json()
         usage = client.get("/api/usage").json()
         assert any(u["account_id"] == body["id"] and u["status"] == "ok"
                    for u in usage)
@@ -103,22 +219,161 @@ class TestAccountsEndpoints:
         )
         assert response.status_code == 422
 
-    def test_add_account_blank_label_is_422(self, client):
-        response = client.post(
-            "/api/accounts",
-            json={"provider": "openai_org", "label": "", "credentials": {}},
-        )
-        assert response.status_code == 422
+    @pytest.mark.parametrize("fields", [{}, {"label": ""}, {"label": "   "}])
+    def test_add_account_missing_or_blank_label_uses_default(self, client, fields):
+        response = client.post("/api/accounts", json={"provider": "openai_org", **fields})
+        assert response.status_code == 201
+        body = response.json()
+        assert body["label"] == body["default_label"] == "openai_org"
+        assert body["custom_label"] is False
+        assert body in client.get("/api/accounts").json()
 
-    def test_delete_manual_account_returns_204(self, client):
+    @pytest.mark.parametrize("raw_label, detail", [
+        (br'"x\udfff"', "label must be valid UTF-8"),
+        (br'"x\u0000"', "label must not contain control characters"),
+        (br'"x\ty"', "label must not contain control characters"),
+        (br'"x\u0085y"', "label must not contain control characters"),
+        (b'" ' + b'x' * 81 + b' "', "label must be at most 80 characters"),
+    ])
+    def test_add_account_rejects_invalid_label_without_writing(
+        self, non_raising_client, tmp_path, raw_label, detail,
+    ):
+        client = non_raising_client
+        before = client.get("/api/accounts").json()
+        usage = client.get("/api/usage").json()
+        secret = b"synthetic-credential"
+        response = client.post(
+            "/api/accounts", headers={"Content-Type": "application/json"},
+            content=(b'{"provider":"openai_org","credentials":{"api_key":"'
+                     + secret + b'"},"label":' + raw_label + b'}'),
+        )
+
+        assert secret not in response.content
+        assert response.status_code == 422
+        assert response.json() == {"detail": detail}
+        config = tmp_path / "config"
+        assert not (config / "accounts.json").exists()
+        assert not (config / "labels.json").exists()
+        listing = client.get("/api/accounts")
+        assert (listing.status_code, listing.json()) == (200, before)
+        assert client.get("/api/usage").json() == usage
+
+    @pytest.mark.parametrize("clear", [None, "", "   "])
+    def test_rename_auto_and_clear_to_default(self, client, clear):
+        before, = client.get("/api/accounts").json()
+        assert before == {
+            "id": "auto-chatgpt-personal",
+            "label": "ChatGPT (local login)",
+            "default_label": "ChatGPT (local login)",
+            "custom_label": False,
+            "provider": "chatgpt_personal",
+            "platform": "openai",
+            "source": "auto",
+        }
+        path = f"/api/accounts/{before['id']}"
+        renamed = {**before, "label": "Personal", "custom_label": True}
+        response = client.patch(path, json={"label": " Personal "}, headers=DASHBOARD_HEADERS)
+        assert (response.status_code, response.json()) == (200, renamed)
+        assert client.get("/api/accounts").json() == [renamed]
+
+        response = client.patch(path, json={"label": clear}, headers=DASHBOARD_HEADERS)
+        assert (response.status_code, response.json()) == (200, before)
+        assert client.get("/api/accounts").json() == [before]
+        assert client.get("/api/usage").json() == []
+
+    def test_rename_manual_accepts_80_characters_after_trimming(self, client):
+        original = client.post("/api/accounts", json={"provider": "openai_org"}).json()
+        before = client.get("/api/accounts").json()
+        usage_before = client.get("/api/usage").json()
+        name = "x" * 80
+        expected = {**original, "label": name, "custom_label": True}
+        response = client.patch(
+            f"/api/accounts/{original['id']}", json={"label": f" {name} "},
+            headers={"Origin": "http://localhost:61524"},
+        )
+        assert (response.status_code, response.json()) == (200, expected)
+        assert client.get("/api/accounts").json() == [before[0], expected]
+        assert client.get("/api/usage").json() == usage_before
+
+    @pytest.mark.parametrize("account_id, label, headers, status, detail", [
+        ("auto-chatgpt-personal", "x" * 81, {"Origin": "http://127.0.0.1:61524"},
+         422, "label must be at most 80 characters"),
+        ("unknown", "Work", {"Origin": "http://127.0.0.1:61524"}, 404, "unknown account"),
+        ("auto-chatgpt-personal", "Work", {}, 403, "Cross-origin account rename denied"),
+        ("auto-chatgpt-personal", "Work", {"Origin": "http://foreign.invalid"},
+         403, "Cross-origin account rename denied"),
+        ("auto-chatgpt-personal", "Work", {"Origin": "http://localhost:61524", "Sec-Fetch-Site": "cross-site"},
+         403, "Cross-origin account rename denied"),
+    ])
+    def test_rejected_rename_leaves_accounts_and_usage_unchanged(
+        self, client, account_id, label, headers, status, detail,
+    ):
+        accounts = client.get("/api/accounts").json()
+        usage = client.get("/api/usage").json()
+        response = client.patch(f"/api/accounts/{account_id}", json={"label": label}, headers=headers)
+        assert (response.status_code, response.json()) == (status, {"detail": detail})
+        assert client.get("/api/accounts").json() == accounts
+        assert client.get("/api/usage").json() == usage
+
+    @pytest.mark.parametrize("payload, detail", [
+        (br'{"label":"\ud800"}', "label must be valid UTF-8"),
+        (br'{"label":"A\u0000B"}', "label must not contain control characters"),
+        (br'{"label":"A\tB"}', "label must not contain control characters"),
+        (br'{"label":"A\u007fB"}', "label must not contain control characters"),
+        (br'{"label":"A\u0085B"}', "label must not contain control characters"),
+    ])
+    def test_rename_rejects_invalid_characters_without_writing(
+        self, non_raising_client, tmp_path, payload, detail,
+    ):
+        client = non_raising_client
+        path = "/api/accounts/auto-chatgpt-personal"
+        rename = client.patch(path, json={"label": "Personal"}, headers=DASHBOARD_HEADERS)
+        assert rename.status_code == 200
+        labels_path = tmp_path / "config" / "labels.json"
+        before = labels_path.read_bytes()
+        usage = client.get("/api/usage").json()
+
+        response = client.patch(
+            path, content=payload, headers={**DASHBOARD_HEADERS, "Content-Type": "application/json"},
+        )
+
+        assert response.status_code == 422
+        assert response.json() == {"detail": detail}
+        assert labels_path.read_bytes() == before
+        listing = client.get("/api/accounts")
+        assert (listing.status_code, listing.json()) == (200, [rename.json()])
+        assert client.get("/api/usage").json() == usage
+
+    @pytest.mark.parametrize("invalid_label", [23, "\ud800", "A\u0085B", " ", "x" * 81])
+    def test_list_accounts_ignores_invalid_stored_label(self, non_raising_client, tmp_path, invalid_label):
+        client = non_raising_client
+        default, = client.get("/api/accounts").json()
+        manual = client.post("/api/accounts", json={"provider": "openai_org"}).json()
+        labels = {default["id"]: invalid_label, manual["id"]: "Valid name"}
+        labels_path = tmp_path / "config" / "labels.json"
+        before = json.dumps(labels).encode("utf-8")
+        labels_path.write_bytes(before)
+
+        listing = client.get("/api/accounts")
+
+        assert listing.status_code == 200
+        assert listing.json() == [default, {**manual, "label": "Valid name", "custom_label": True}]
+        assert labels_path.read_bytes() == before
+
+    def test_delete_manual_account_returns_204(self, client, tmp_path):
         body = client.post(
             "/api/accounts",
             json={"provider": "openai_org", "label": "Org", "credentials": {}},
         ).json()
-        response = client.delete(f"/api/accounts/{body['id']}")
-        assert response.status_code == 204
-        assert all(a["id"] != body["id"]
-                   for a in client.get("/api/accounts").json())
+        path = f"/api/accounts/{body['id']}"
+        rename = client.patch(path, json={"label": "Renamed"}, headers=DASHBOARD_HEADERS)
+        assert rename.status_code == 200
+        response = client.delete(path)
+        assert (response.status_code, response.content) == (204, b"")
+        assert all(a["id"] != body["id"] for a in client.get("/api/accounts").json())
+        config = tmp_path / "config"
+        assert json.loads((config / "accounts.json").read_bytes()) == []
+        assert json.loads((config / "labels.json").read_bytes()) == {}
 
     def test_delete_auto_account_returns_409(self, client):
         response = client.delete("/api/accounts/auto-chatgpt-personal")
@@ -421,7 +676,8 @@ class TestOAuthLogin:
 
 
 class TestClaudeCallback:
-    def test_happy_path_creates_manual_account_and_polls(self, oauth_env):
+    @pytest.mark.parametrize("callback", ["/callback", "/api/oauth/claude/callback"])
+    def test_happy_path_creates_manual_account_and_polls(self, oauth_env, callback, caplog):
         client = oauth_env.client
         assert client.get("/api/oauth/attempts/unknown").status_code == 404
         login = client.post("/api/oauth/claude_personal/login")
@@ -429,10 +685,10 @@ class TestClaudeCallback:
         assert client.get(attempt).json() == {"status": "pending"}
         state = oauth_env.claude.authorize_calls[0][1]
 
-        response = oauth_env.client.get(
-            "/api/oauth/claude/callback",
-            params={"code": "auth-code", "state": state},
-        )
+        with caplog.at_level(logging.INFO, logger="ai_usage_monitor.api"):
+            response = oauth_env.client.get(
+                callback, params={"code": "auth-code", "state": state, "extra": "query-marker"},
+            )
 
         assert response.status_code == 200
         assert "text/html" in response.headers["content-type"]
@@ -457,6 +713,7 @@ class TestClaudeCallback:
             "email": "user@example.com",
         }
         assert config.origin == "oauth"
+        assert _api_info_messages(caplog) == ["Claude OAuth callback received"]
         # The new account was polled immediately.
         usage = oauth_env.client.get("/api/usage").json()
         assert any(
@@ -769,20 +1026,25 @@ async def test_chatgpt_listener_stops_when_last_pending_attempt_expires(oauth_en
             await asyncio.gather(task, return_exceptions=True)
 
 
+def _api_info_messages(caplog):
+    return [record.getMessage() for record in caplog.records
+            if record.name == "ai_usage_monitor.api" and record.levelno == logging.INFO]
+
+
 class TestChatGPTCompletion:
     """The temporary listener's completion callback mirrors the Claude
     callback: exchange, add account, poll once, redirect to the app origin."""
 
-    async def test_completion_adds_account_and_redirects_to_origin(
-        self, oauth_env
-    ):
+    async def test_completion_adds_account_and_redirects_to_origin(self, oauth_env, caplog):
         oauth_env.client.post("/api/oauth/chatgpt_personal/login")
         state = oauth_env.chatgpt.authorize_calls[0][1]
         handler = oauth_env.listener_handlers[0][1]
 
-        location = await handler("auth-code", state)
+        with caplog.at_level(logging.INFO, logger="ai_usage_monitor.api"):
+            location = await handler("auth-code", state)
 
         assert location == "http://127.0.0.1:61524/"
+        assert _api_info_messages(caplog) == ["ChatGPT OAuth callback received"]
         infos = oauth_env.registry.list_infos()
         assert [i.provider for i in infos] == [ProviderKind.chatgpt_personal]
         assert infos[0].label == "gpt@example.com"
@@ -798,17 +1060,26 @@ class TestChatGPTCompletion:
             u["account_id"] == infos[0].id and u["status"] == "ok" for u in usage
         )
 
-    async def test_completion_defaults_label_without_email(self, oauth_env):
+    @pytest.mark.parametrize("email", [None, "a" * 64 + "@example-domain.com"])
+    async def test_completion_defaults_label_without_usable_email(self, oauth_env, email):
         oauth_env.chatgpt.exchange_result = {
             k: v for k, v in CHATGPT_EXCHANGE.items() if k != "email"
         }
-        oauth_env.client.post("/api/oauth/chatgpt_personal/login")
-        state = oauth_env.chatgpt.authorize_calls[0][1]
+        if email is not None:
+            oauth_env.chatgpt.exchange_result["email"] = email
+        login = oauth_env.client.post("/api/oauth/chatgpt_personal/login")
+        assert login.status_code == 200
+        state = _state(login)
         handler = oauth_env.listener_handlers[-1][1]
 
-        await handler("auth-code", state)
+        assert await handler("auth-code", state) == "http://127.0.0.1:61524/"
 
-        assert oauth_env.registry.list_infos()[0].label == "ChatGPT OAuth"
+        assert oauth_env.client.get(_attempt(login)).json() == {"status": "completed"}
+        listing = oauth_env.client.get("/api/accounts")
+        assert listing.status_code == 200
+        info, = listing.json()
+        assert info["label"] == info["default_label"] == "ChatGPT OAuth"
+        assert info["custom_label"] is False
 
     async def test_completion_rejects_state_mismatch(self, oauth_env):
         from ai_usage_monitor.api import OAuthCallbackError
@@ -859,3 +1130,142 @@ def test_dashboard_assets_referenced_by_index_are_served(client):
         path = urlparse(urljoin("http://testserver/", ref)).path
         response = client.get(path)
         assert response.status_code == 200, f"{ref} resolves to {path}: {response.status_code}"
+
+
+def test_recreated_account_does_not_inherit_orphaned_label(
+    client, tmp_path, monkeypatch,
+):
+    import uuid
+
+    create = {"provider": "openai_org", "label": "New account"}
+    old = client.post("/api/accounts", json=create)
+    assert old.status_code == 201
+    old_id = old.json()["id"]
+    headers = {"Origin": "http://localhost:61524"}
+    assert client.patch(
+        f"/api/accounts/{old_id}", headers=headers, json={"label": "Café privé"},
+    ).status_code == 200
+
+    labels = tmp_path / "config" / "labels.json"
+    replace = os.replace
+
+    def deny_label_replace(source, target):
+        if target == labels:
+            raise PermissionError("labels replacement denied")
+        return replace(source, target)
+
+    monkeypatch.setattr(os, "replace", deny_label_replace)
+    assert client.delete(f"/api/accounts/{old_id}").status_code == 204
+    assert "Café privé" not in client.get("/api/accounts").text
+
+    colliding_uuid = uuid.UUID(old_id.rsplit("-", 1)[1] + "0" * 24)
+    uuid4 = uuid.uuid4
+    candidates = iter([colliding_uuid])
+    monkeypatch.setattr(uuid, "uuid4", lambda: next(candidates, None) or uuid4())
+
+    new = client.post("/api/accounts", json=create)
+    assert new.status_code == 201
+    info = new.json()
+    listing = client.get("/api/accounts").json()
+    persisted = next(row for row in listing if row["id"] == info["id"])
+    for row in (info, persisted):
+        assert row["label"] == row["default_label"] == "New account"
+        assert row["custom_label"] is False
+
+
+def test_add_does_not_reuse_orphan_id_if_labels_unreadable(
+    non_raising_client, tmp_path, monkeypatch,
+):
+    import uuid
+    from pathlib import Path
+    from unittest.mock import patch
+
+    client = non_raising_client
+    body = {"provider": "openai_org"}
+    origin = {"Origin": "http://localhost:61524"}
+    first = client.post("/api/accounts", json=body)
+    old = first.json()["id"]
+    route = f"/api/accounts/{old}"
+    assert client.patch(route, headers=origin, json={"label": "Old name"}).status_code == 200
+    stores = tmp_path / "config"
+    labels = stores / "labels.json"
+    accounts = stores / "accounts.json"
+    before_labels = labels.read_bytes()
+    read = Path.read_text
+
+    def read_fault(path, *args, **kwargs):
+        if path == labels:
+            raise PermissionError("synthetic read fault")
+        return read(path, *args, **kwargs)
+
+    def manual(rows):
+        return [row for row in rows if row["source"] == "manual"]
+
+    with patch.object(Path, "read_text", read_fault):
+        assert client.delete(route).status_code == 204
+        assert manual(client.get("/api/accounts").json()) == []
+        before_accounts = accounts.read_bytes()
+        draw = uuid.uuid4
+        candidates = iter([uuid.UUID(old.rsplit("-", 1)[1] + "0" * 24)])
+        monkeypatch.setattr(uuid, "uuid4", lambda: next(candidates, None) or draw())
+        response = client.post("/api/accounts", json=body)
+
+    assert labels.read_bytes() == before_labels
+    if response.status_code == 201:
+        info = response.json()
+        assert info["id"] != old
+        assert info["label"] == info["default_label"] == "openai_org"
+        assert info["custom_label"] is False
+        assert manual(client.get("/api/accounts").json()) == [info]
+    else:
+        assert 400 <= response.status_code < 600
+        assert accounts.read_bytes() == before_accounts
+        assert manual(client.get("/api/accounts").json()) == []
+
+
+@pytest.mark.parametrize("new_label", [None, "Another name"])
+def test_rename_does_not_report_success_when_labels_unreadable(
+    non_raising_client, tmp_path, monkeypatch, new_label,
+):
+    from pathlib import Path
+
+    client = non_raising_client
+    origin = {"Origin": "http://localhost:61524"}
+    first, second = [
+        client.post("/api/accounts", json={"provider": "openai_org"}).json()["id"]
+        for _ in range(2)
+    ]
+    assert client.patch(
+        f"/api/accounts/{first}", headers=origin, json={"label": "Keep me"},
+    ).status_code == 200
+    labels = tmp_path / "config" / "labels.json"
+    accounts = labels.with_name("accounts.json")
+    before = labels.read_bytes(), accounts.read_bytes()
+    read = Path.read_text
+
+    def read_fault(path, *args, **kwargs):
+        if path == labels:
+            raise PermissionError("synthetic read fault")
+        return read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_fault)
+    target = first if new_label is None else second
+    response = client.patch(
+        f"/api/accounts/{target}", headers=origin, json={"label": new_label},
+    )
+    assert 400 <= response.status_code < 600
+    assert (labels.read_bytes(), accounts.read_bytes()) == before
+
+
+def test_tab_only_label_defaults_on_add_and_clears_on_rename(client):
+    added = client.post("/api/accounts", json={"provider": "openai_org", "label": "\t"})
+    assert added.status_code == 201
+    default = added.json()
+    assert default["label"] == default["default_label"] == "openai_org"
+    assert default["custom_label"] is False
+    route = f"/api/accounts/{default['id']}"
+    origin = {"Origin": "http://localhost:61524"}
+    assert client.patch(route, headers=origin, json={"label": "Work"}).status_code == 200
+    cleared = client.patch(route, headers=origin, json={"label": "\t"})
+    assert cleared.status_code == 200
+    assert cleared.json() == default

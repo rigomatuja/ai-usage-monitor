@@ -32,10 +32,10 @@ def test_422_does_not_echo_credential_values(tmp_path):
         response = client.post(
             "/api/accounts",
             json={
-                "provider": "openai_org",
+                "provider": "not-a-provider",
                 "credentials": {"api_key": "sk-SECRET-XYZ"},
             },
-        )  # label missing -> 422
+        )  # unknown provider -> 422 (labels are optional since v1.3)
         assert response.status_code == 422
         assert "sk-SECRET-XYZ" not in str(response.json())
 

@@ -11,18 +11,18 @@ from time import monotonic
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
-from fastapi import APIRouter, FastAPI, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from ai_usage_monitor.models import (
-    PROVIDER_PLATFORMS,
     AccountInfo,
     ProviderKind,
     UsageSnapshot,
 )
-from ai_usage_monitor.registry import AccountError, AccountRegistry
+from ai_usage_monitor.oauth import ChatGPTOAuthClient, ClaudeOAuthClient
 from ai_usage_monitor.poller import HTTP_TIMEOUT_SECONDS, UsagePoller
+from ai_usage_monitor.registry import AccountError, AccountRegistry, InvalidAccountLabel
 
 logger = logging.getLogger(__name__)
 
@@ -174,8 +174,35 @@ async def _start_chatgpt_listener(
 
 class NewAccountRequest(BaseModel):
     provider: ProviderKind
-    label: str = Field(min_length=1)
+    label: str = Field(
+        default="",
+        description="UTF-8 text without control characters, up to 80 characters after trimming; "
+        "omit or leave blank to use the provider default.",
+    )
     credentials: dict[str, str] = Field(default_factory=dict)
+
+
+class RenameAccountRequest(BaseModel):
+    label: str | None = Field(
+        description="UTF-8 text without control characters, up to 80 characters after trimming; "
+        "null or blank clears the name.",
+    )
+
+
+def _require_dashboard_origin(request: Request, *, denied_detail: str) -> None:
+    app = request.app
+    origins = request.headers.getlist("origin")
+    dashboard_origins = (app.state.app_origin, f"http://localhost:{app.state.app_port}")
+    if (
+        len(origins) != 1
+        or origins[0] not in dashboard_origins
+        or "cross-site" in request.headers.getlist("sec-fetch-site")
+    ):
+        raise HTTPException(status_code=403, detail=denied_detail)
+
+
+async def _require_rename_origin(request: Request) -> None:
+    _require_dashboard_origin(request, denied_detail="Cross-origin account rename denied")
 
 
 def build_router(registry: AccountRegistry, poller: UsagePoller) -> APIRouter:
@@ -204,7 +231,11 @@ def build_router(registry: AccountRegistry, poller: UsagePoller) -> APIRouter:
         "/api/accounts", status_code=status.HTTP_201_CREATED
     )
     async def add_account(body: NewAccountRequest, request: Request) -> AccountInfo:
-        account = registry.add_account(body.provider, body.label, body.credentials)
+        try:
+            account = registry.add_account(body.provider, body.label, body.credentials)
+        except InvalidAccountLabel as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        info = registry.get_info(account.id)
         # Poll immediately so the new account shows data without waiting
         # for the next background cycle; errors are stored, not raised.
         http = await _client_for(request)
@@ -213,13 +244,20 @@ def build_router(registry: AccountRegistry, poller: UsagePoller) -> APIRouter:
         finally:
             if not _is_app_client(request, http):
                 await http.aclose()
-        return AccountInfo(
-            id=account.id,
-            label=account.label,
-            provider=account.provider,
-            platform=PROVIDER_PLATFORMS[account.provider],
-            source="manual",
-        )
+        return info
+
+    @router.patch(
+        "/api/accounts/{account_id}",
+        dependencies=[Depends(_require_rename_origin)],
+        responses={403: {"description": "Requests must originate from the dashboard"}},
+    )
+    async def rename_account(account_id: str, body: RenameAccountRequest) -> AccountInfo:
+        try:
+            return registry.set_label(account_id, body.label)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="unknown account") from None
+        except InvalidAccountLabel as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @router.delete("/api/accounts/{account_id}", status_code=status.HTTP_204_NO_CONTENT)
     async def remove_account(account_id: str) -> Response:
@@ -255,8 +293,6 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
     def _oauth_clients(app: FastAPI) -> dict:
         clients = getattr(app.state, "oauth_clients", None)
         if clients is None:  # direct router use without create_app wiring
-            from ai_usage_monitor.oauth import ChatGPTOAuthClient, ClaudeOAuthClient
-
             clients = {_CLAUDE: ClaudeOAuthClient(), _CHATGPT: ChatGPTOAuthClient()}
             app.state.oauth_clients = clients
         return clients
@@ -335,10 +371,17 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
                 exchanged = await client.exchange_code(http, code, pending["verifier"], state)
                 message = _ATTEMPT_ERRORS["failed"]
                 credentials = _credential_dict(exchanged)
-                account = app.state.registry.add_account(
-                    ProviderKind(provider), credentials.get("email") or label, credentials,
-                    origin="oauth",
-                )
+                try:
+                    account = app.state.registry.add_account(
+                        ProviderKind(provider), credentials.get("email") or label, credentials,
+                        origin="oauth",
+                    )
+                except InvalidAccountLabel:
+                    # A provider email is only a suggested label. Validation
+                    # failed before writing; finish sign-in with the fallback.
+                    account = app.state.registry.add_account(
+                        ProviderKind(provider), label, credentials, origin="oauth",
+                    )
                 stored = True
                 _mark_attempt(app, pending, "completed")
                 await app.state.poller.poll_account(account.id, http)
@@ -353,6 +396,7 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
 
     def _chatgpt_completion(app: FastAPI):
         async def complete(code: str | None, state: str | None) -> str:
+            logger.info("ChatGPT OAuth callback received")
             await _complete_sign_in(app, _CHATGPT, "ChatGPT OAuth", code, state)
             return app.state.app_origin + "/"
 
@@ -368,14 +412,7 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
                 status_code=404, detail=f"unknown oauth provider: {provider}"
             )
         app = request.app
-        origins = request.headers.getlist("origin")
-        dashboard_origins = (app.state.app_origin, f"http://localhost:{app.state.app_port}")
-        if (
-            len(origins) != 1
-            or origins[0] not in dashboard_origins
-            or "cross-site" in request.headers.getlist("sec-fetch-site")
-        ):
-            raise HTTPException(status_code=403, detail="Cross-origin OAuth login denied")
+        _require_dashboard_origin(request, denied_detail="Cross-origin OAuth login denied")
         async with app.state.oauth_login_lock:
             return await _start_login(app, provider)
 
@@ -421,10 +458,12 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
             app.state.oauth_listener_deadline.extend()
         return {"authorize_url": authorize_url, "attempt_id": attempt_id}
 
+    @router.get(ClaudeOAuthClient.CALLBACK_PATH, include_in_schema=False)
     @router.get("/api/oauth/claude/callback", include_in_schema=False)
     async def claude_oauth_callback(
         request: Request, code: str | None = None, state: str | None = None
     ) -> Response:
+        logger.info("Claude OAuth callback received")
         app = request.app
         # The returned code may be {code}#{state}: split and use both parts.
         if code:

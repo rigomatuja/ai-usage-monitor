@@ -51,6 +51,8 @@ class AccountInfo(BaseModel):
 
     id: str
     label: str
+    default_label: str
+    custom_label: bool
     provider: ProviderKind
     platform: Literal["claude", "openai"]
     source: Literal["auto", "manual"]

@@ -82,8 +82,9 @@ def claude_params(url: str) -> dict[str, str]:
     return {k: v[0] for k, v in query.items()}
 
 
-def test_claude_authorize_url_exact_params():
-    client = ClaudeOAuthClient(port=61524)
+@pytest.mark.parametrize("port", [61524, 9999])
+def test_claude_authorize_url_exact_params(port):
+    client = ClaudeOAuthClient(port=port)
     verifier = generate_pkce_verifier()
     state = generate_state()
     url = client.build_authorize_url(verifier, state)
@@ -95,7 +96,7 @@ def test_claude_authorize_url_exact_params():
         "code": "true",
         "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
         "response_type": "code",
-        "redirect_uri": "http://localhost:61524/api/oauth/claude/callback",
+        "redirect_uri": f"http://localhost:{port}/callback",
         "scope": "user:profile user:inference",
         "code_challenge": challenge_from_verifier(verifier),
         "code_challenge_method": "S256",
@@ -122,6 +123,7 @@ def test_chatgpt_authorize_url_exact_params():
         "state": state,
         "id_token_add_organizations": "true",
         "codex_cli_simplified_flow": "true",
+        "originator": "codex_cli_rs",
     }
 
 
@@ -187,6 +189,7 @@ async def test_claude_exchange_happy_path():
     verifier = generate_pkce_verifier()
     state = generate_state()
 
+    authorize = claude_params(client.build_authorize_url(verifier, state))
     creds = await client.exchange_code(http, "authcode", verifier, state)
 
     request = seen[0]
@@ -197,9 +200,10 @@ async def test_claude_exchange_happy_path():
         "code": "authcode",
         "state": state,
         "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-        "redirect_uri": "http://localhost:61524/api/oauth/claude/callback",
+        "redirect_uri": "http://localhost:61524/callback",
         "code_verifier": verifier,
     }
+    assert body["redirect_uri"] == authorize["redirect_uri"]
     assert creds["access_token"] == "sk-ant-oat01-xyz"
     assert creds["refresh_token"] == "sk-ant-ort01-xyz"
     assert creds["email"] == "me@example.com"

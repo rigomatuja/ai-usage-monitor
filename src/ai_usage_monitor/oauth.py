@@ -76,7 +76,7 @@ class ClaudeOAuthClient:
     TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
     CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
     SCOPE = "user:profile user:inference"
-    CALLBACK_PATH = "/api/oauth/claude/callback"
+    CALLBACK_PATH = "/callback"
     # Default app port (odd log L2: "podemos usar algun puerto raro como
     # por ejemplo 61524"); worker B passes the actual app port.
     DEFAULT_PORT = 61524
@@ -261,6 +261,7 @@ class ChatGPTOAuthClient:
             "state": state,
             "id_token_add_organizations": "true",
             "codex_cli_simplified_flow": "true",
+            "originator": "codex_cli_rs",
         }
         query = "&".join(
             f"{name}={_url_quote(value)}" for name, value in params.items()

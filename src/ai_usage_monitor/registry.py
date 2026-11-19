@@ -2,12 +2,14 @@
 
 Auto accounts are derived from the presence of local CLI login files; manual
 accounts are persisted as JSON under the user config directory with 0600
-permissions (they may contain credentials).
+permissions (they may contain credentials). Custom labels for either kind of
+account are stored separately with the same permissions.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
 from pathlib import Path
@@ -23,6 +25,8 @@ from ai_usage_monitor.models import (
 )
 from ai_usage_monitor.providers.base import UsageProvider
 
+logger = logging.getLogger(__name__)
+
 CLAUDE_CREDENTIALS_FILENAME = ".claude/.credentials.json"
 CODEX_AUTH_FILENAME = ".codex/auth.json"
 
@@ -32,6 +36,24 @@ AUTO_CHATGPT_ID = "auto-chatgpt-personal"
 
 class AccountError(Exception):
     """A manual account operation failed (e.g. removing an auto account)."""
+
+
+class InvalidAccountLabel(ValueError):
+    """A custom label has invalid text or exceeds the length limit."""
+
+
+def _normalize_custom_label(label: str) -> str:
+    try:
+        label.encode("utf-8")
+    except UnicodeEncodeError:
+        raise InvalidAccountLabel("label must be valid UTF-8") from None
+    # Trim first: whitespace-only input (spaces, tabs, newlines) means "no name".
+    label = label.strip()
+    if any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in label):
+        raise InvalidAccountLabel("label must not contain control characters")
+    if len(label) > 80:
+        raise InvalidAccountLabel("label must be at most 80 characters")
+    return label
 
 
 class AccountRegistry:
@@ -45,6 +67,7 @@ class AccountRegistry:
     ) -> None:
         self._config_dir = config_dir or Path(user_config_dir("ai-usage-monitor"))
         self._accounts_file = self._config_dir / "accounts.json"
+        self._labels_file = self._config_dir / "labels.json"
         self._claude_path = claude_credentials_path or (
             Path.home() / CLAUDE_CREDENTIALS_FILENAME
         )
@@ -89,11 +112,70 @@ class AccountRegistry:
         return [AccountConfig.model_validate(item) for item in raw]
 
     def _save_manual(self, accounts: list[AccountConfig]) -> None:
+        self._save_json(self._accounts_file, [account.model_dump(mode="json") for account in accounts])
+
+    def _load_labels(self) -> dict[str, str]:
+        try:
+            return self._read_labels()
+        except (ValueError, OSError):
+            return {}
+
+    def _load_labels_for_write(self) -> dict[str, str]:
+        """Labels for an operation that writes labels.json: a missing or
+        unparseable store counts as empty, but any other read error aborts so
+        a write can never silently drop names it could not read."""
+        try:
+            return self._read_labels()
+        except (FileNotFoundError, ValueError):
+            return {}
+
+    def _read_labels(self) -> dict[str, str]:
+        try:
+            raw = json.loads(self._labels_file.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        if not isinstance(raw, dict):
+            raise ValueError("expected a labels object")
+        labels: dict[str, str] = {}
+        for key, value in raw.items():
+            if not isinstance(value, str):
+                continue
+            try:
+                label = _normalize_custom_label(value)
+            except InvalidAccountLabel:
+                continue
+            if label:
+                labels[key] = label
+        return labels
+
+    @staticmethod
+    def _current_labels(
+        labels: dict[str, str], accounts: list[AccountConfig]
+    ) -> dict[str, str]:
+        current_ids = {account.id for account in accounts}
+        return {key: value for key, value in labels.items() if key in current_ids}
+
+    def _clean_labels_best_effort(
+        self, manual_accounts: list[AccountConfig], *, new_account_id: str | None = None
+    ) -> None:
+        try:
+            labels = self._read_labels()
+            if new_account_id is not None and new_account_id not in labels:
+                return
+            current = self._current_labels(labels, self._auto_configs() + manual_accounts)
+            if new_account_id is not None:
+                current.pop(new_account_id, None)
+            if current != labels:
+                self._save_json(self._labels_file, current)
+        except Exception as exc:
+            logger.warning("Could not clean up account labels (%s)", type(exc).__name__)
+
+    def _save_json(self, path: Path, data: list[dict] | dict[str, str]) -> None:
+        payload = json.dumps(data, indent=2) + "\n"
         self._config_dir.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps([account.model_dump(mode="json") for account in accounts], indent=2) + "\n"
         # Write privately beside the target so an interrupted write cannot
         # truncate the live store and replacement stays on the same filesystem.
-        temp = self._accounts_file.with_name(f".tmp-{uuid.uuid4().hex}-{self._accounts_file.name}")
+        temp = path.with_name(f".tmp-{uuid.uuid4().hex}-{path.name}")
         fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             try:
@@ -104,33 +186,70 @@ class AccountRegistry:
                     os.fsync(fd)
             finally:
                 os.close(fd)
-            os.replace(temp, self._accounts_file)
+            os.replace(temp, path)
         except BaseException:
             temp.unlink(missing_ok=True)
             raise
 
     # -- public API ---------------------------------------------------------
 
+    def _stored_label_ids(self) -> set[str]:
+        """Ids present in labels.json, including orphans. A missing or
+        unparseable store has none; other read errors abort the add."""
+        try:
+            raw = json.loads(self._labels_file.read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError):
+            return set()
+        return set(raw) if isinstance(raw, dict) else set()
+
     def add_account(
         self,
         provider: ProviderKind,
-        label: str,
-        credentials: dict[str, str],
+        label: str | None = None,
+        credentials: dict[str, str] | None = None,
         *,
         origin: Literal["manual", "oauth"] = "manual",
     ) -> AccountConfig:
-        """Persist a new account added manually or through OAuth."""
+        """Persist a new account added manually or through OAuth.
+
+        Raises ValueError for an invalid label before changing either store.
+        """
+        default_label = _normalize_custom_label(label or "") or provider.value
+        accounts = self._load_manual()
+        # Never reuse an id that still has a stored (possibly orphaned) name, so
+        # a new account cannot inherit a deleted account's custom label.
+        taken = {item.id for item in accounts} | self._stored_label_ids()
+        account_id = f"{provider.value}-{uuid.uuid4().hex[:8]}"
+        while account_id in taken:
+            account_id = f"{provider.value}-{uuid.uuid4().hex[:8]}"
         account = AccountConfig(
-            id=f"{provider.value}-{uuid.uuid4().hex[:8]}",
+            id=account_id,
             provider=provider,
-            label=label.strip() or provider.value,
-            credentials=credentials,
+            label=default_label,
+            credentials=credentials if credentials is not None else {},
             origin=origin,
         )
-        accounts = self._load_manual()
         accounts.append(account)
         self._save_manual(accounts)
+        self._clean_labels_best_effort(accounts, new_account_id=account.id)
         return account
+
+    def set_label(self, account_id: str, label: str | None) -> AccountInfo:
+        """Set or clear a display name without changing the account config."""
+        accounts = self.iter_configs()
+        account = next((item for item in accounts if item.id == account_id), None)
+        if account is None:
+            raise KeyError(account_id)
+        label = _normalize_custom_label(label or "")
+        labels = self._load_labels_for_write()
+        if label or account_id in labels:
+            if label:
+                labels[account_id] = label
+            else:
+                del labels[account_id]
+            labels = self._current_labels(labels, accounts)
+            self._save_json(self._labels_file, labels)
+        return self._account_info(account, labels)
 
     def remove_account(self, account_id: str) -> None:
         """Remove a manual account. Raises AccountError for auto accounts,
@@ -144,7 +263,10 @@ class AccountRegistry:
         remaining = [a for a in accounts if a.id != account_id]
         if len(remaining) == len(accounts):
             raise KeyError(account_id)
+        # Commit the deletion before touching labels. If cleanup fails, reads
+        # ignore the orphan and the next labels write can prune it.
         self._save_manual(remaining)
+        self._clean_labels_best_effort(remaining)
 
     def update_credentials(self, account_id: str, credentials: dict[str, str]) -> None:
         """Replace the stored credentials of a manual account and persist
@@ -175,17 +297,26 @@ class AccountRegistry:
                 return account
         return None
 
+    def get_info(self, account_id: str) -> AccountInfo:
+        account = self.get_config(account_id)
+        if account is None:
+            raise KeyError(account_id)
+        return self._account_info(account, self._load_labels())
+
     def list_infos(self) -> list[AccountInfo]:
-        return [
-            AccountInfo(
-                id=account.id,
-                label=account.label,
-                provider=account.provider,
-                platform=PROVIDER_PLATFORMS[account.provider],
-                source="auto" if self.is_auto(account.id) else "manual",
-            )
-            for account in self.iter_configs()
-        ]
+        labels = self._load_labels()
+        return [self._account_info(account, labels) for account in self.iter_configs()]
+
+    def _account_info(self, account: AccountConfig, labels: dict[str, str]) -> AccountInfo:
+        return AccountInfo(
+            id=account.id,
+            label=labels.get(account.id, account.label),
+            default_label=account.label,
+            custom_label=account.id in labels,
+            provider=account.provider,
+            platform=PROVIDER_PLATFORMS[account.provider],
+            source="auto" if self.is_auto(account.id) else "manual",
+        )
 
 
 PROVIDER_CLASSES: dict[ProviderKind, str] = {

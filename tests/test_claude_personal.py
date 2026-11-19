@@ -13,7 +13,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from ai_usage_monitor.models import WindowKind
+from ai_usage_monitor.models import UsageWindow, WindowKind
 from ai_usage_monitor.providers.base import ProviderError
 from ai_usage_monitor.providers.claude_personal import ClaudePersonalProvider
 
@@ -147,8 +147,12 @@ async def test_limits_array_preferred_over_top_level(tmp_path):
         [
             ok(
                 {
-                    "limits": [{"kind": "weekly_all", "percent": 7.0, "resets_at": None}],
+                    "limits": [
+                        {"kind": "weekly_all", "percent": 7.0, "resets_at": None},
+                        {"kind": "session", "percent": 12.0, "resets_at": None},
+                    ],
                     "five_hour": {"utilization": 99.0, "resets_at": None},
+                    "seven_day": {"utilization": 88.0, "resets_at": None},
                 }
             )
         ],
@@ -157,8 +161,8 @@ async def test_limits_array_preferred_over_top_level(tmp_path):
     provider = ClaudePersonalProvider(credentials_for(creds))
     windows = await provider.fetch(http)
 
-    assert [w.kind for w in windows] == [WindowKind.weekly]
-    assert [w.used_percent for w in windows] == [7.0]
+    assert [w.kind for w in windows] == [WindowKind.five_hour, WindowKind.weekly]
+    assert [w.used_percent for w in windows] == [12.0, 7.0]
 
 
 # ------------------------------------------------------- credentials handling
@@ -170,7 +174,7 @@ async def test_custom_credentials_path_used(tmp_path):
     http = make_http([ok({"limits": []})], seen)
     provider = ClaudePersonalProvider({"credentials_path": str(creds)})
     windows = await provider.fetch(http)
-    assert windows == []
+    assert windows == [inactive_session("claude_code_max")]
 
 
 async def test_missing_credentials_file(tmp_path):
@@ -301,18 +305,56 @@ async def test_inline_credentials_do_not_require_credentials_path_key():
     seen: list[httpx.Request] = []
     http = make_http([ok({"limits": []})], seen)
     provider = ClaudePersonalProvider({"access_token": ACCESS_TOKEN})
-    assert await provider.fetch(http) == []
+    assert await provider.fetch(http) == [inactive_session()]
     assert str(seen[0].url) == USAGE_URL
 
 
 # ---------------------------------------------------------- tolerant parsing
 
 
-async def test_empty_response_yields_no_windows(tmp_path):
+def inactive_session(subscription: str | None = None) -> UsageWindow:
+    return UsageWindow(
+        kind=WindowKind.five_hour,
+        label="5-hour session",
+        used_percent=0.0,
+        detail=f"{subscription} · No active session" if subscription else "No active session",
+        resets_at=None,
+    )
+
+
+@pytest.mark.parametrize("session_entries, top_level", [
+    ([], {"utilization": 27, "resets_at": "2026-11-05T18:00:00Z"}),
+    ([{"kind": "session", "percent": None}], {"utilization": 27, "resets_at": "2026-11-05T18:00:00Z"}),
+    ([{"kind": "session", "percent": None}], None),
+    ([], {"utilization": None}),
+])
+async def test_missing_usable_limits_session_falls_back(tmp_path, session_entries, top_level):
+    subscription = "claude_code_max"
+    creds = write_credentials(tmp_path, cred_payload())
+    payload = {"limits": [{"kind": "weekly_all", "percent": 11}, *session_entries]}
+    if top_level is not None:
+        payload["five_hour"] = top_level
+    provider = ClaudePersonalProvider(credentials_for(creds))
+    async with make_http([ok(payload)], []) as http:
+        windows = await provider.fetch(http)
+
+    expected_session = inactive_session(subscription)
+    if top_level and top_level["utilization"] == 27:
+        expected_session = UsageWindow(
+            kind=WindowKind.five_hour, label="5-hour session", used_percent=27,
+            detail=subscription, resets_at=datetime(2026, 11, 5, 18, 0, tzinfo=timezone.utc),
+        )
+    assert windows == [
+        expected_session,
+        UsageWindow(kind=WindowKind.weekly, label="Weekly", used_percent=11, detail=subscription),
+    ]
+
+
+async def test_empty_response_yields_only_inactive_session(tmp_path):
     creds = write_credentials(tmp_path, cred_payload())
     provider = ClaudePersonalProvider(credentials_for(creds))
     http = make_http([ok({})], [])
-    assert await provider.fetch(http) == []
+    assert await provider.fetch(http) == [inactive_session("claude_code_max")]
 
 
 async def test_unknown_limit_kind_omitted(tmp_path):
@@ -321,7 +363,7 @@ async def test_unknown_limit_kind_omitted(tmp_path):
     http = make_http(
         [ok({"limits": [{"kind": "daily", "percent": 5.0, "resets_at": None}]})], []
     )
-    assert await provider.fetch(http) == []
+    assert await provider.fetch(http) == [inactive_session("claude_code_max")]
 
 
 async def test_absent_optional_fields_omitted_not_error(tmp_path):
@@ -345,14 +387,18 @@ async def test_absent_optional_fields_omitted_not_error(tmp_path):
     assert windows[0].detail is None  # no subscriptionType in credentials file
 
 
-async def test_weekly_scoped_label_uses_scope_model_display_name(tmp_path):
-    """Real API shape (verified live 2026-11): the scoped model name lives in
-    scope.model.display_name, not in a top-level "model" key."""
-    creds = write_credentials(tmp_path, cred_payload())
+@pytest.mark.parametrize("subscription", [None, "claude_code_max"])
+async def test_inactive_session_before_live_weekly_windows(tmp_path, subscription):
+    """Live payload with no active session and a scoped model at scope.model."""
+    payload = cred_payload()
+    if subscription is None:
+        del payload["subscriptionType"]
+    creds = write_credentials(tmp_path, payload)
     http = make_http(
         [
             ok(
                 {
+                    "five_hour": None,
                     "limits": [
                         {"kind": "weekly_all", "percent": 11, "resets_at": None, "scope": None},
                         {
@@ -368,4 +414,8 @@ async def test_weekly_scoped_label_uses_scope_model_display_name(tmp_path):
         [],
     )
     windows = await ClaudePersonalProvider(credentials_for(creds)).fetch(http)
-    assert [w.label for w in windows] == ["Weekly", "Weekly · Fable"]
+    assert windows == [
+        inactive_session(subscription),
+        UsageWindow(kind=WindowKind.weekly, label="Weekly", used_percent=11, detail=subscription),
+        UsageWindow(kind=WindowKind.weekly, label="Weekly · Fable", used_percent=0, detail=subscription),
+    ]
