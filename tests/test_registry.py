@@ -7,6 +7,7 @@ import os
 import stat
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -128,6 +129,41 @@ class TestManualAccounts:
         account = registry.add_account(ProviderKind.openai_org, "   ", {})
         assert account.label == "openai_org"
 
+    @pytest.mark.parametrize("label, reason", [
+        ("x\udfff", "label must be valid UTF-8"),
+        ("A\u0000B", "label must not contain control characters"),
+        ("A\u009fB", "label must not contain control characters"),
+        (" " + "x" * 81 + " ", "label must be at most 80 characters"),
+    ])
+    def test_add_account_rejects_invalid_label_before_writing(self, tmp_path, label, reason):
+        registry = make_registry(tmp_path)
+
+        with pytest.raises(ValueError, match=f"^{reason}$"):
+            registry.add_account(ProviderKind.openai_org, label)
+
+        assert registry.list_infos() == []
+        config = tmp_path / "config"
+        assert not (config / "accounts.json").exists()
+        assert not (config / "labels.json").exists()
+
+    def test_add_account_drops_stale_label_for_new_id(self, tmp_path, monkeypatch):
+        from ai_usage_monitor import registry as registry_module
+
+        registry = make_registry(tmp_path, claude=True)
+        registry.set_label(AUTO_CLAUDE_ID, "Keep me")
+        labels = tmp_path / "config" / "labels.json"
+        account_id = "openai_org-deadbeef"
+        expected = {AUTO_CLAUDE_ID: "Keep me"}
+        labels.write_text(json.dumps({**expected, account_id: "Old org"}), encoding="utf-8")
+        monkeypatch.setattr(registry_module.uuid, "uuid4", lambda: SimpleNamespace(hex="deadbeef"))
+
+        account = registry.add_account(ProviderKind.openai_org)
+
+        assert account.id == account_id
+        info = registry.get_info(account.id)
+        assert (info.label, info.default_label, info.custom_label) == ("openai_org", "openai_org", False)
+        assert json.loads(labels.read_bytes()) == expected
+
     def test_remove_manual_account(self, tmp_path):
         registry = make_registry(tmp_path)
         account = registry.add_account(
@@ -188,17 +224,19 @@ class TestCustomLabels:
             (manual.id, "Work", "Original", True),
         ]
 
-    def test_removing_manual_account_drops_only_its_custom_label(self, tmp_path):
+    def test_removing_manual_account_prunes_orphans_but_keeps_active_auto_label(self, tmp_path):
         registry = make_registry(tmp_path, claude=True)
         manual = registry.add_account(ProviderKind.openai_org, credentials={})
-        registry.set_label(AUTO_CLAUDE_ID, "Personal")
-        registry.set_label(manual.id, "Work")
+        path = tmp_path / "config" / "labels.json"
+        path.write_text(json.dumps({
+            AUTO_CLAUDE_ID: "Personal", AUTO_CHATGPT_ID: "Old login",
+            manual.id: "Work", "openai_org-orphan": "Old org",
+        }), encoding="utf-8")
 
         registry.remove_account(manual.id)
 
         assert [(i.id, i.label) for i in registry.list_infos()] == [(AUTO_CLAUDE_ID, "Personal")]
-        path = tmp_path / "config" / "labels.json"
-        assert json.loads(path.read_text(encoding="utf-8")) == {AUTO_CLAUDE_ID: "Personal"}
+        assert json.loads(path.read_bytes()) == {AUTO_CLAUDE_ID: "Personal"}
 
     @pytest.mark.parametrize("label, reason", [
         ("\ud800", "label must be valid UTF-8"),

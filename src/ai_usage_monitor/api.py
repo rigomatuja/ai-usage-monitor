@@ -174,7 +174,11 @@ async def _start_chatgpt_listener(
 
 class NewAccountRequest(BaseModel):
     provider: ProviderKind
-    label: str = Field(default="", description="Omit or leave blank to use the provider default.")
+    label: str = Field(
+        default="",
+        description="UTF-8 text without control characters, up to 80 characters after trimming; "
+        "omit or leave blank to use the provider default.",
+    )
     credentials: dict[str, str] = Field(default_factory=dict)
 
 
@@ -227,7 +231,10 @@ def build_router(registry: AccountRegistry, poller: UsagePoller) -> APIRouter:
         "/api/accounts", status_code=status.HTTP_201_CREATED
     )
     async def add_account(body: NewAccountRequest, request: Request) -> AccountInfo:
-        account = registry.add_account(body.provider, body.label, body.credentials)
+        try:
+            account = registry.add_account(body.provider, body.label, body.credentials)
+        except InvalidAccountLabel as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         info = registry.get_info(account.id)
         # Poll immediately so the new account shows data without waiting
         # for the next background cycle; errors are stored, not raised.
@@ -364,10 +371,17 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
                 exchanged = await client.exchange_code(http, code, pending["verifier"], state)
                 message = _ATTEMPT_ERRORS["failed"]
                 credentials = _credential_dict(exchanged)
-                account = app.state.registry.add_account(
-                    ProviderKind(provider), credentials.get("email") or label, credentials,
-                    origin="oauth",
-                )
+                try:
+                    account = app.state.registry.add_account(
+                        ProviderKind(provider), credentials.get("email") or label, credentials,
+                        origin="oauth",
+                    )
+                except InvalidAccountLabel:
+                    # A provider email is only a suggested label. Validation
+                    # failed before writing; finish sign-in with the fallback.
+                    account = app.state.registry.add_account(
+                        ProviderKind(provider), label, credentials, origin="oauth",
+                    )
                 stored = True
                 _mark_attempt(app, pending, "completed")
                 await app.state.poller.poll_account(account.id, http)

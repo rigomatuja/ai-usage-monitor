@@ -9,6 +9,7 @@ account are stored separately with the same permissions.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
 from pathlib import Path
@@ -23,6 +24,8 @@ from ai_usage_monitor.models import (
     ProviderKind,
 )
 from ai_usage_monitor.providers.base import UsageProvider
+
+logger = logging.getLogger(__name__)
 
 CLAUDE_CREDENTIALS_FILENAME = ".claude/.credentials.json"
 CODEX_AUTH_FILENAME = ".codex/auth.json"
@@ -113,11 +116,17 @@ class AccountRegistry:
 
     def _load_labels(self) -> dict[str, str]:
         try:
-            raw = json.loads(self._labels_file.read_text(encoding="utf-8"))
+            return self._read_labels()
         except (ValueError, OSError):
             return {}
-        if not isinstance(raw, dict):
+
+    def _read_labels(self) -> dict[str, str]:
+        try:
+            raw = json.loads(self._labels_file.read_text(encoding="utf-8"))
+        except FileNotFoundError:
             return {}
+        if not isinstance(raw, dict):
+            raise ValueError("expected a labels object")
         labels: dict[str, str] = {}
         for key, value in raw.items():
             if not isinstance(value, str):
@@ -130,10 +139,30 @@ class AccountRegistry:
                 labels[key] = label
         return labels
 
-    def _save_json(self, path: Path, data: list[dict] | dict[str, str]) -> None:
-        self._write_atomic(path, json.dumps(data, indent=2) + "\n")
+    @staticmethod
+    def _current_labels(
+        labels: dict[str, str], accounts: list[AccountConfig]
+    ) -> dict[str, str]:
+        current_ids = {account.id for account in accounts}
+        return {key: value for key, value in labels.items() if key in current_ids}
 
-    def _write_atomic(self, path: Path, payload: str) -> None:
+    def _clean_labels_best_effort(
+        self, manual_accounts: list[AccountConfig], *, new_account_id: str | None = None
+    ) -> None:
+        try:
+            labels = self._read_labels()
+            if new_account_id is not None and new_account_id not in labels:
+                return
+            current = self._current_labels(labels, self._auto_configs() + manual_accounts)
+            if new_account_id is not None:
+                current.pop(new_account_id, None)
+            if current != labels:
+                self._save_json(self._labels_file, current)
+        except Exception as exc:
+            logger.warning("Could not clean up account labels (%s)", type(exc).__name__)
+
+    def _save_json(self, path: Path, data: list[dict] | dict[str, str]) -> None:
+        payload = json.dumps(data, indent=2) + "\n"
         self._config_dir.mkdir(parents=True, exist_ok=True)
         # Write privately beside the target so an interrupted write cannot
         # truncate the live store and replacement stays on the same filesystem.
@@ -163,37 +192,40 @@ class AccountRegistry:
         *,
         origin: Literal["manual", "oauth"] = "manual",
     ) -> AccountConfig:
-        """Persist a new account added manually or through OAuth."""
+        """Persist a new account added manually or through OAuth.
+
+        Raises ValueError for an invalid label before changing either store.
+        """
+        default_label = _normalize_custom_label(label or "") or provider.value
         account = AccountConfig(
             id=f"{provider.value}-{uuid.uuid4().hex[:8]}",
             provider=provider,
-            label=(label or "").strip() or provider.value,
+            label=default_label,
             credentials=credentials if credentials is not None else {},
             origin=origin,
         )
         accounts = self._load_manual()
         accounts.append(account)
         self._save_manual(accounts)
+        self._clean_labels_best_effort(accounts, new_account_id=account.id)
         return account
 
     def set_label(self, account_id: str, label: str | None) -> AccountInfo:
         """Set or clear a display name without changing the account config."""
-        account = self.get_config(account_id)
+        accounts = self.iter_configs()
+        account = next((item for item in accounts if item.id == account_id), None)
         if account is None:
             raise KeyError(account_id)
         label = _normalize_custom_label(label or "")
         labels = self._load_labels()
-        if label:
-            labels[account_id] = label
+        if label or account_id in labels:
+            if label:
+                labels[account_id] = label
+            else:
+                del labels[account_id]
+            labels = self._current_labels(labels, accounts)
             self._save_json(self._labels_file, labels)
-        else:
-            self._drop_label(account_id, labels)
         return self._account_info(account, labels)
-
-    def _drop_label(self, account_id: str, labels: dict[str, str]) -> None:
-        if account_id in labels:
-            del labels[account_id]
-            self._save_json(self._labels_file, labels)
 
     def remove_account(self, account_id: str) -> None:
         """Remove a manual account. Raises AccountError for auto accounts,
@@ -207,29 +239,10 @@ class AccountRegistry:
         remaining = [a for a in accounts if a.id != account_id]
         if len(remaining) == len(accounts):
             raise KeyError(account_id)
-        # Both stores change together: a strict read (only a missing file counts
-        # as "no labels"), drop the label, then the account; if the account write
-        # fails, restore the exact previous label bytes.
-        try:
-            labels_text = self._labels_file.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            labels_text = None
-        try:
-            raw_labels = json.loads(labels_text) if labels_text is not None else {}
-        except ValueError:
-            raw_labels = {}  # unparseable labels are ignored everywhere
-        dropped = isinstance(raw_labels, dict) and account_id in raw_labels
-        if dropped:
-            self._save_json(
-                self._labels_file,
-                {key: value for key, value in raw_labels.items() if key != account_id},
-            )
-        try:
-            self._save_manual(remaining)
-        except BaseException:
-            if dropped:
-                self._write_atomic(self._labels_file, labels_text)
-            raise
+        # Commit the deletion before touching labels. If cleanup fails, reads
+        # ignore the orphan and the next labels write can prune it.
+        self._save_manual(remaining)
+        self._clean_labels_best_effort(remaining)
 
     def update_credentials(self, account_id: str, credentials: dict[str, str]) -> None:
         """Replace the stored credentials of a manual account and persist
