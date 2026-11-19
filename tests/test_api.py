@@ -475,8 +475,8 @@ class TestClaudeCallback:
         assert response.status_code == 200
         assert len(oauth_env.registry.list_infos()) == 1
 
-    @pytest.mark.parametrize("non_ascii", [False, True])
-    def test_conflicting_code_and_query_states_leave_both_attempts_pending(self, oauth_env, monkeypatch, non_ascii):
+    @pytest.mark.parametrize("embedded_case", ["other_attempt", "non_ascii", "empty"])
+    def test_conflicting_code_and_query_states_leave_both_attempts_pending(self, oauth_env, monkeypatch, embedded_case):
         from ai_usage_monitor.oauth import ClaudeOAuthClient
 
         exchange = oauth_env.claude.exchange_code
@@ -492,7 +492,7 @@ class TestClaudeCallback:
         callback = "/api/oauth/claude/callback"
         first, second = client.post(login_path), client.post(login_path)
         assert first.status_code == second.status_code == 200
-        embedded = "ñ" if non_ascii else _state(second)
+        embedded = {"other_attempt": _state(second), "non_ascii": "ñ", "empty": ""}[embedded_case]
 
         response = client.get(callback, params={"code": f"auth-code#{embedded}", "state": _state(first)})
 

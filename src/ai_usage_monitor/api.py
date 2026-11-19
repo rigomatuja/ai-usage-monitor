@@ -420,9 +420,13 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
         app = request.app
         # The returned code may be {code}#{state}: split and use both parts.
         if code:
-            code, _, embedded_state = code.partition("#")
-            if embedded_state:
-                if state and not secrets.compare_digest(state.encode(), embedded_state.encode()):
+            code, separator, embedded_state = code.partition("#")
+            # A '#' always carries a state, even an empty one: an empty or
+            # conflicting embedded state is rejected before any attempt is consumed.
+            if separator:
+                if not embedded_state or (
+                    state and not secrets.compare_digest(state.encode(), embedded_state.encode())
+                ):
                     return _html_error("Invalid or expired sign-in state.")
                 state = embedded_state
         try:
