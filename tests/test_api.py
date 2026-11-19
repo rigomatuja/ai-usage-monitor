@@ -1345,6 +1345,13 @@ async def test_chatgpt_listener_rejects_duplicate_state_without_consuming(oauth_
     "code=auth-code%23{s}&state={s}",
     "code=auth-code%23&state={s}",
     "state={s}&code=auth-code#{s}",
+    "code=auth-code&code=other-code&state={s}",
+    "code=auth-code&%63ode=auth-code&state={s}",
+    "code=auth-code&state={s}&%73tate={s}",
+    "state={s}&code=auth-code#",
+    "state={s}&code=%23auth-code",
+    "state={s}&code=auth%23code",
+    "code=auth#code&state={s}",
 ])
 async def test_chatgpt_listener_rejects_blank_duplicates_and_embedded_state(
     oauth_env, monkeypatch, query_tail,
@@ -1381,7 +1388,12 @@ async def test_chatgpt_listener_rejects_blank_duplicates_and_embedded_state(
         state = _state(login)
         task = app.state.oauth_listener_task
         try:
+            def store_bytes():
+                return {p.name: p.read_bytes() for p in oauth_env.registry._config_dir.glob("*.json")}
+
+            before = store_bytes()
             rejected = await callback(query_tail.format(s=state))
+            assert store_bytes() == before
             assert rejected.startswith(b"HTTP/1.1 400")
             assert oauth_env.chatgpt.exchange_calls == []
             assert (await client.get(_attempt(login))).json() == {"status": "pending"}
