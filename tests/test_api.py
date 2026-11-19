@@ -68,6 +68,48 @@ def non_raising_client(accounts_app):
 
 
 class TestAccountsEndpoints:
+    @pytest.mark.parametrize("failure", ["labels-read", "accounts-replace"])
+    def test_delete_preserves_both_files_on_store_failure(
+        self, non_raising_client, tmp_path, monkeypatch, failure,
+    ):
+        from pathlib import Path
+
+        client = non_raising_client
+        added = client.post(
+            "/api/accounts",
+            json={"provider": "openai_org", "credentials": {"api_key": "synthetic"}},
+        )
+        assert added.status_code == 201
+        path = f"/api/accounts/{added.json()['id']}"
+        assert client.patch(
+            path, json={"label": "Keep me"}, headers=DASHBOARD_HEADERS,
+        ).status_code == 200
+        accounts = tmp_path / "config" / "accounts.json"
+        labels = accounts.with_name("labels.json")
+        before = (accounts.read_bytes(), labels.read_bytes())
+
+        read_text, replace = Path.read_text, os.replace
+
+        def checked_read(file, *args, **kwargs):
+            if file == labels:
+                raise PermissionError("label store unreadable")
+            return read_text(file, *args, **kwargs)
+
+        def checked_replace(source, target):
+            if target == accounts:
+                raise OSError("account replacement failed")
+            return replace(source, target)
+
+        with monkeypatch.context() as faults:
+            if failure == "labels-read":
+                faults.setattr(Path, "read_text", checked_read)
+            else:
+                faults.setattr(os, "replace", checked_replace)
+            result = client.delete(path)
+
+        assert (result.status_code, result.text) == (500, "Internal Server Error")
+        assert (accounts.read_bytes(), labels.read_bytes()) == before
+
     def test_list_accounts_includes_auto(self, client):
         response = client.get("/api/accounts")
         assert response.status_code == 200

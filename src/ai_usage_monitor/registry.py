@@ -131,8 +131,10 @@ class AccountRegistry:
         return labels
 
     def _save_json(self, path: Path, data: list[dict] | dict[str, str]) -> None:
+        self._write_atomic(path, json.dumps(data, indent=2) + "\n")
+
+    def _write_atomic(self, path: Path, payload: str) -> None:
         self._config_dir.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(data, indent=2) + "\n"
         # Write privately beside the target so an interrupted write cannot
         # truncate the live store and replacement stays on the same filesystem.
         temp = path.with_name(f".tmp-{uuid.uuid4().hex}-{path.name}")
@@ -205,9 +207,29 @@ class AccountRegistry:
         remaining = [a for a in accounts if a.id != account_id]
         if len(remaining) == len(accounts):
             raise KeyError(account_id)
-        # If label cleanup fails, leave the account and its credentials intact.
-        self._drop_label(account_id, self._load_labels())
-        self._save_manual(remaining)
+        # Both stores change together: a strict read (only a missing file counts
+        # as "no labels"), drop the label, then the account; if the account write
+        # fails, restore the exact previous label bytes.
+        try:
+            labels_text = self._labels_file.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            labels_text = None
+        try:
+            raw_labels = json.loads(labels_text) if labels_text is not None else {}
+        except ValueError:
+            raw_labels = {}  # unparseable labels are ignored everywhere
+        dropped = isinstance(raw_labels, dict) and account_id in raw_labels
+        if dropped:
+            self._save_json(
+                self._labels_file,
+                {key: value for key, value in raw_labels.items() if key != account_id},
+            )
+        try:
+            self._save_manual(remaining)
+        except BaseException:
+            if dropped:
+                self._write_atomic(self._labels_file, labels_text)
+            raise
 
     def update_credentials(self, account_id: str, credentials: dict[str, str]) -> None:
         """Replace the stored credentials of a manual account and persist
