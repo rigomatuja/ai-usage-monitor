@@ -49,17 +49,21 @@ def create_app(
             return
         async with httpx.AsyncClient(timeout=30.0) as http:
             app.state.http = http
-            await poller.poll_all(http)
-            task = asyncio.create_task(poller.run(http))
-            yield
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-            listener_task = getattr(app.state, "oauth_listener_task", None)
-            if listener_task is not None:
-                listener_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await listener_task
+            tasks = [asyncio.create_task(poller.run_flush_loop())]
+            try:
+                await poller.poll_all(http)
+                tasks.append(asyncio.create_task(poller.run(http)))
+                yield
+            finally:
+                listener_task = getattr(app.state, "oauth_listener_task", None)
+                if listener_task is not None:
+                    tasks.append(listener_task)
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                for task in tasks:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        task.result()
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -67,7 +71,7 @@ def create_app(
             async with background(app):
                 yield
         finally:
-            unsaved = poller.flush_unpersisted()
+            unsaved = await poller.flush_unpersisted()
             if unsaved:
                 logger.error("Rotated credentials unsaved at shutdown for %s", ", ".join(unsaved))
 

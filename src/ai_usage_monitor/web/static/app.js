@@ -12,7 +12,7 @@
 const POLL_INTERVAL_MS = 60 * 1000; // server caches and polls providers at >= 300 s
 
 let accounts = [];
-let oauthStartCount = null;
+let pendingOauth = null;
 let connectionLost = false;
 
 const $ = (id) => document.getElementById(id);
@@ -228,7 +228,9 @@ let lastUsage = [];
 
 async function loadAccounts() {
   accounts = await getJson("/api/accounts");
-  if (oauthStartCount !== null && accounts.length > oauthStartCount) {
+  if (pendingOauth && accounts.some(({ id, provider, source }) =>
+    !pendingOauth.accountIds.has(id) && provider === pendingOauth.provider && source === "manual"
+  )) {
     clearOauthStatus();
   }
 }
@@ -325,13 +327,14 @@ async function onAddSubmit(event) {
 // POST /api/oauth/{provider}/login -> 200 {authorize_url}; 404 unknown provider.
 // The authorize URL comes from the server; app.js never hardcodes one.
 const OAUTH_LOGIN_PATHS = {
-  claude: "/api/oauth/claude_personal/login",
-  chatgpt: "/api/oauth/chatgpt_personal/login",
+  claude_personal: "/api/oauth/claude_personal/login",
+  chatgpt_personal: "/api/oauth/chatgpt_personal/login",
 };
 
 function clearOauthStatus() {
-  oauthStartCount = null;
+  pendingOauth = null;
   els.oauthWaiting.classList.add("hidden");
+  els.oauthWaiting.textContent = "";
   els.oauthError.classList.add("hidden");
 }
 
@@ -341,18 +344,24 @@ function showOauthError(message) {
   els.oauthError.classList.remove("hidden");
 }
 
-async function startOauthLogin(providerKey) {
+async function startOauthLogin(provider) {
   const tab = window.open("", "_blank");
   clearOauthStatus(); // clicking again resets any previous status
-  oauthStartCount = accounts.length;
+  const attempt = { provider, accountIds: new Set(accounts.map(({ id }) => id)) };
+  pendingOauth = attempt;
   let res;
   let body = null;
   try {
-    res = await fetchJson(OAUTH_LOGIN_PATHS[providerKey], { method: "POST" });
+    res = await fetchJson(OAUTH_LOGIN_PATHS[provider], { method: "POST" });
     body = await res.json();
   } catch (err) {
     if (tab) tab.close();
-    showOauthError("connection lost");
+    if (pendingOauth === attempt) showOauthError("connection lost");
+    return;
+  }
+  // A newer sign-in or a completed accounts reload may have cleared this attempt.
+  if (pendingOauth !== attempt) {
+    if (tab) tab.close();
     return;
   }
   if (!res.ok) {
@@ -376,6 +385,10 @@ async function startOauthLogin(providerKey) {
     link.textContent = "Open the sign-in page";
     els.oauthWaiting.replaceChildren(link);
   }
+  const dismiss = el("button", null, "Dismiss");
+  dismiss.type = "button";
+  dismiss.addEventListener("click", clearOauthStatus);
+  els.oauthWaiting.append(" ", dismiss);
   els.oauthWaiting.classList.remove("hidden");
 }
 
@@ -383,8 +396,8 @@ async function startOauthLogin(providerKey) {
 
 els.refreshBtn.addEventListener("click", onRefreshClick);
 els.form.addEventListener("submit", onAddSubmit);
-els.signinClaude.addEventListener("click", () => startOauthLogin("claude"));
-els.signinChatgpt.addEventListener("click", () => startOauthLogin("chatgpt"));
+els.signinClaude.addEventListener("click", () => startOauthLogin("claude_personal"));
+els.signinChatgpt.addEventListener("click", () => startOauthLogin("chatgpt_personal"));
 
 refreshAll().catch((err) => console.error("initial load failed:", err));
 setInterval(() => {

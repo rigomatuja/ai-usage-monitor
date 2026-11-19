@@ -18,6 +18,7 @@ from ai_usage_monitor.registry import AccountRegistry
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_SECONDS = 300.0
+ROTATION_RETRY_INTERVAL_SECONDS = 30
 
 
 def _default_should_refresh(credentials: dict[str, str]) -> bool:
@@ -85,10 +86,20 @@ class UsagePoller:
         else:
             self._unpersisted.pop(account_id, None)
 
-    def flush_unpersisted(self) -> list[str]:
+    def _account_lock(self, account_id: str) -> asyncio.Lock:
+        lock = self._poll_locks.get(account_id)
+        if lock is None:
+            lock = self._poll_locks[account_id] = asyncio.Lock()
+        return lock
+
+    async def flush_unpersisted(self) -> list[str]:
         """Retry each pending credential write and report unsaved account IDs."""
-        for account_id, credentials in list(self._unpersisted.items()):
-            self._persist(account_id, credentials)
+        for account_id in list(self._unpersisted):
+            async with self._account_lock(account_id):
+                # The poll may have saved or replaced this rotation while we waited.
+                credentials = self._unpersisted.get(account_id)
+                if credentials is not None:
+                    self._persist(account_id, credentials)
         return list(self._unpersisted)
 
     async def _refresh(self, account_id, provider, credentials, http) -> dict[str, str] | None:
@@ -106,10 +117,7 @@ class UsagePoller:
     ) -> UsageSnapshot:
         """Poll one account and store its snapshot. Raises KeyError if the
         account does not exist."""
-        lock = self._poll_locks.get(account_id)
-        if lock is None:
-            lock = self._poll_locks[account_id] = asyncio.Lock()
-        async with lock:
+        async with self._account_lock(account_id):
             return await self._poll_account(account_id, http)
 
     async def _poll_account(self, account_id: str, http: httpx.AsyncClient) -> UsageSnapshot:
@@ -207,5 +215,10 @@ class UsagePoller:
         """Poll all accounts forever, once per interval."""
         while True:
             await asyncio.sleep(self._interval)
-            self.flush_unpersisted()
             await self.poll_all(http)
+
+    async def run_flush_loop(self, interval: float = ROTATION_RETRY_INTERVAL_SECONDS) -> None:
+        """Retry pending writes on a separate cadence without polling providers."""
+        while True:
+            await asyncio.sleep(interval)
+            await self.flush_unpersisted()

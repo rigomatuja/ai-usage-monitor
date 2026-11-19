@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from unittest.mock import DEFAULT, AsyncMock, Mock
 
 import httpx
 import pytest
 
+from ai_usage_monitor.app import create_app
 from ai_usage_monitor.models import ProviderKind, UsageWindow, WindowKind
 from ai_usage_monitor.oauth import OAuthError
 from ai_usage_monitor.poller import UsagePoller
@@ -223,12 +225,97 @@ class TestPrefetchRefresh:
                              refresh_fn=refresh, should_refresh=lambda c: True)
         assert (await poller.poll_account(account.id, http)).status == "ok"
         assert registry.get_config(account.id).credentials == self.OLD_CREDENTIALS
-        assert poller.flush_unpersisted() == ([account.id] if persist_fails else [])
+        assert await poller.flush_unpersisted() == ([account.id] if persist_fails else [])
         rotated = dict(self.ROTATED, expires_at="1893456000000")
         assert registry.get_config(account.id).credentials == (self.OLD_CREDENTIALS if persist_fails else rotated)
         if not persist_fails:
-            assert poller.flush_unpersisted() == []
+            assert await poller.flush_unpersisted() == []
         assert persist.call_count == 2
+        refresh.assert_awaited_once_with(http, ProviderKind.claude_personal, self.OLD_CREDENTIALS)
+
+    async def test_flush_loop_retries_without_polling(self, setup, http, monkeypatch):
+        registry, _ = setup
+        account = self._add_oauth_account(registry)
+        refresh = AsyncMock(return_value=self.ROTATED)
+        provider_factory = Mock(side_effect=lambda c: FakeProvider(c.credentials))
+        poller = UsagePoller(registry, provider_factory, refresh_fn=refresh,
+                             should_refresh=lambda c: True)
+        update = registry.update_credentials
+        saved = asyncio.Event()
+        writes = 0
+
+        def persist(account_id, credentials):
+            nonlocal writes
+            writes += 1
+            if writes <= 2:  # initial write and the first scheduled retry
+                raise OSError("disk")
+            update(account_id, credentials)
+            saved.set()
+
+        monkeypatch.setattr(registry, "update_credentials", persist)
+        assert (await poller.poll_account(account.id, http)).status == "ok"
+        assert registry.get_config(account.id).credentials == self.OLD_CREDENTIALS
+        provider_factory.reset_mock()
+        refresh.reset_mock()
+
+        retry = asyncio.create_task(poller.run_flush_loop(interval=0.001))
+        try:
+            await asyncio.wait_for(saved.wait(), timeout=1)
+        finally:
+            retry.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await retry
+
+        assert writes == 3
+        assert registry.get_config(account.id).credentials == dict(self.ROTATED, expires_at="1893456000000")
+        provider_factory.assert_not_called()
+        refresh.assert_not_called()
+
+    async def test_flush_waits_for_poll_to_release_account_lock(self, setup, http, monkeypatch):
+        registry, _ = setup
+        account = self._add_oauth_account(registry)
+        refresh = AsyncMock(return_value=self.ROTATED)
+        fetch_started = asyncio.Event()
+        allow_fetch = asyncio.Event()
+        update = registry.update_credentials
+        persist = Mock(wraps=update, side_effect=OSError("disk"))
+        monkeypatch.setattr(registry, "update_credentials", persist)
+
+        class BlockingProvider(FakeProvider):
+            async def fetch(self, http):
+                fetch_started.set()
+                await allow_fetch.wait()
+                return await super().fetch(http)
+
+        factory = Mock(side_effect=lambda c: FakeProvider(c.credentials))
+        poller = UsagePoller(registry, factory, refresh_fn=refresh,
+                             should_refresh=lambda c: c["access_token"] == "old-at")
+        assert (await poller.poll_account(account.id, http)).status == "ok"
+        factory.side_effect = lambda c: BlockingProvider(c.credentials)
+        poll = asyncio.create_task(poller.poll_account(account.id, http))
+        try:
+            await asyncio.wait_for(fetch_started.wait(), timeout=1)
+            persist.side_effect = None
+            persist.reset_mock()
+            assert registry.get_config(account.id).credentials == self.OLD_CREDENTIALS
+
+            retry = asyncio.create_task(poller.flush_unpersisted())
+            try:
+                await asyncio.sleep(0)  # let the flusher reach the account lock
+                persist.assert_not_called()
+                assert not retry.done()
+            finally:
+                allow_fetch.set()
+                unsaved = await asyncio.wait_for(retry, timeout=1)
+        finally:
+            allow_fetch.set()
+            snapshot = await asyncio.wait_for(poll, timeout=1)
+
+        assert snapshot.status == "ok"
+        assert unsaved == []
+        rotated = dict(self.ROTATED, expires_at="1893456000000")
+        persist.assert_called_once_with(account.id, rotated)
+        assert registry.get_config(account.id).credentials == rotated
         refresh.assert_awaited_once_with(http, ProviderKind.claude_personal, self.OLD_CREDENTIALS)
 
     @pytest.mark.parametrize("persist_fails", [False, True], ids=["reactive_401", "persist_failure"])
@@ -360,6 +447,34 @@ class TestPrefetchRefresh:
 
         assert snapshot.status == "ok"
         assert registry.get_config(account.id).credentials == self.OLD_CREDENTIALS
+
+    async def test_lifespan_cancels_retry_before_final_flush(self, setup, monkeypatch, caplog):
+        registry, poller = setup
+        started = asyncio.Event()
+        order = []
+
+        async def retry():
+            order.append("retry started")
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                order.append("retry cancelled")
+
+        async def flush():
+            order.append("final flush")
+            return ["unsaved-account"]
+
+        monkeypatch.setattr(poller, "run_flush_loop", retry)
+        monkeypatch.setattr(poller, "flush_unpersisted", flush)
+        app = create_app(registry=registry, poller=poller)
+        with pytest.raises(RuntimeError, match="shutdown after error"):
+            async with app.router.lifespan_context(app):
+                await asyncio.wait_for(started.wait(), timeout=1)
+                raise RuntimeError("shutdown after error")
+
+        assert order == ["retry started", "retry cancelled", "final flush"]
+        assert caplog.messages == ["Rotated credentials unsaved at shutdown for unsaved-account"]
 
     async def test_refresh_failure_proceeds_with_existing_token(
         self, setup, http, fake_windows, caplog
