@@ -116,7 +116,8 @@ async def _start_chatgpt_listener(
                 if not line or line in (b"\r\n", b"\n"):
                     break
             parts = request_line.split()
-            parsed = urlsplit(parts[1] if len(parts) >= 2 else "/")
+            target = parts[1] if len(parts) >= 2 else "/"
+            parsed = urlsplit(target)
             if parsed.path != _CHATGPT_CALLBACK_PATH:
                 payload = b"not found"
                 writer.write(
@@ -125,9 +126,21 @@ async def _start_chatgpt_listener(
                 )
                 await writer.drain()
                 return  # keep waiting for the real callback
-            params = parse_qs(parsed.query)
+            # keep_blank_values: "state=&state=X" must count as a duplicate.
+            params = parse_qs(parsed.query, keep_blank_values=True)
             code = (params.get("code") or [None])[0]
             state = (params.get("state") or [None])[0]
+            if (
+                len(params.get("code", [])) > 1
+                or len(params.get("state", [])) > 1
+                or (code is not None and "#" in code)
+                # urlsplit drops a literal fragment before validation: reject it.
+                or "#" in target
+            ):
+                # Ambiguous or malformed callback (OpenAI codes never embed a
+                # state): reject like an unknown state, so no attempt is
+                # consumed and the listener keeps serving.
+                state = None
             try:
                 location = await complete(code, state)
                 head = f"HTTP/1.1 302 Found\r\nLocation: {location}\r\n"
@@ -464,6 +477,10 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
         request: Request, code: str | None = None, state: str | None = None
     ) -> Response:
         logger.info("Claude OAuth callback received")
+        query = request.query_params
+        if len(query.getlist("code")) > 1 or len(query.getlist("state")) > 1:
+            # Ambiguous callback: reject before selecting or consuming any attempt.
+            return _html_error("Invalid or expired sign-in state.")
         app = request.app
         # The returned code may be {code}#{state}: split and use both parts.
         if code:

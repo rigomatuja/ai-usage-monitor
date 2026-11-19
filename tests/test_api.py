@@ -1269,3 +1269,139 @@ def test_tab_only_label_defaults_on_add_and_clears_on_rename(client):
     cleared = client.patch(route, headers=origin, json={"label": "\t"})
     assert cleared.status_code == 200
     assert cleared.json() == default
+
+
+@pytest.mark.parametrize("path", ["/callback", "/api/oauth/claude/callback"])
+@pytest.mark.parametrize("duplicated", ["state", "code"])
+def test_claude_callback_rejects_duplicate_query_params(oauth_env, path, duplicated):
+    client = oauth_env.client
+    first = client.post("/api/oauth/claude_personal/login")
+    second = client.post("/api/oauth/claude_personal/login")
+    assert first.status_code == second.status_code == 200
+    if duplicated == "state":
+        params = [("code", "synthetic-code"), ("state", _state(first)), ("state", _state(second))]
+    else:
+        params = [("code", "code-a"), ("code", "code-b"), ("state", _state(first))]
+
+    response = client.get(path, params=params)
+
+    assert response.status_code == 400
+    assert response.headers["content-type"] == "text/html; charset=utf-8"
+    assert "Invalid or expired sign-in state." in response.text
+    assert oauth_env.claude.exchange_calls == []
+    assert client.get(_attempt(first)).json() == {"status": "pending"}
+    assert client.get(_attempt(second)).json() == {"status": "pending"}
+    assert [a for a in client.get("/api/accounts").json() if a["source"] == "manual"] == []
+
+
+async def test_chatgpt_listener_rejects_duplicate_state_without_consuming(oauth_env, monkeypatch):
+    from ai_usage_monitor.app import create_app
+
+    start_server = asyncio.start_server
+    port = 0
+
+    async def bind_ephemeral(*args, **kwargs):
+        nonlocal port
+        server = await start_server(*args, **kwargs)
+        port = server.sockets[0].getsockname()[1]
+        return server
+
+    monkeypatch.setattr(asyncio, "start_server", bind_ephemeral)
+    app = create_app(registry=oauth_env.registry, poller=oauth_env.app.state.poller,
+                     start_background=False, oauth_callback_port=0,
+                     oauth_clients={"chatgpt_personal": oauth_env.chatgpt})
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                 base_url="http://test", headers=DASHBOARD_HEADERS) as client:
+        path = "/api/oauth/chatgpt_personal/login"
+        first, second = await client.post(path), await client.post(path)
+        assert first.status_code == second.status_code == 200
+        task = app.state.oauth_listener_task
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            try:
+                writer.write(
+                    f"GET /auth/callback?code=auth-code&state={_state(first)}&state={_state(second)}"
+                    " HTTP/1.1\r\n\r\n".encode()
+                )
+                await writer.drain()
+                response = await asyncio.wait_for(reader.read(), 2)
+            finally:
+                writer.close()
+                await writer.wait_closed()
+            assert response.startswith(b"HTTP/1.1 400")
+            assert (await client.get(_attempt(first))).json() == {"status": "pending"}
+            assert (await client.get(_attempt(second))).json() == {"status": "pending"}
+            assert not task.done()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("query_tail", [
+    "code=&code=auth-code&state={s}",
+    "code=auth-code&code=&state={s}",
+    "code=auth-code&state=&state={s}",
+    "code=auth-code&state={s}&state=",
+    "code=auth-code%23{s}&state={s}",
+    "code=auth-code%23&state={s}",
+    "state={s}&code=auth-code#{s}",
+    "code=auth-code&code=other-code&state={s}",
+    "code=auth-code&%63ode=auth-code&state={s}",
+    "code=auth-code&state={s}&%73tate={s}",
+    "state={s}&code=auth-code#",
+    "state={s}&code=%23auth-code",
+    "state={s}&code=auth%23code",
+    "code=auth#code&state={s}",
+])
+async def test_chatgpt_listener_rejects_blank_duplicates_and_embedded_state(
+    oauth_env, monkeypatch, query_tail,
+):
+    from ai_usage_monitor.app import create_app
+
+    start_server = asyncio.start_server
+    port = 0
+
+    async def bind_ephemeral(*args, **kwargs):
+        nonlocal port
+        server = await start_server(*args, **kwargs)
+        port = server.sockets[0].getsockname()[1]
+        return server
+
+    async def callback(query):
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(f"GET /auth/callback?{query} HTTP/1.1\r\n\r\n".encode())
+            await writer.drain()
+            return await asyncio.wait_for(reader.read(), 2)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    monkeypatch.setattr(asyncio, "start_server", bind_ephemeral)
+    app = create_app(registry=oauth_env.registry, poller=oauth_env.app.state.poller,
+                     start_background=False, oauth_callback_port=0,
+                     oauth_clients={"chatgpt_personal": oauth_env.chatgpt})
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                 base_url="http://test", headers=DASHBOARD_HEADERS) as client:
+        login = await client.post("/api/oauth/chatgpt_personal/login")
+        assert login.status_code == 200
+        state = _state(login)
+        task = app.state.oauth_listener_task
+        try:
+            def store_bytes():
+                return {p.name: p.read_bytes() for p in oauth_env.registry._config_dir.glob("*.json")}
+
+            before = store_bytes()
+            rejected = await callback(query_tail.format(s=state))
+            assert store_bytes() == before
+            assert rejected.startswith(b"HTTP/1.1 400")
+            assert oauth_env.chatgpt.exchange_calls == []
+            assert (await client.get(_attempt(login))).json() == {"status": "pending"}
+            assert not task.done()
+            # The same attempt still completes with a well-formed callback.
+            accepted = await callback(f"code=auth-code&state={state}")
+            assert accepted.startswith(b"HTTP/1.1 302")
+            assert (await client.get(_attempt(login))).json() == {"status": "completed"}
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
