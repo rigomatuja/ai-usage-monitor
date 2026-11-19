@@ -128,6 +128,10 @@ async def _start_chatgpt_listener(
             params = parse_qs(parsed.query)
             code = (params.get("code") or [None])[0]
             state = (params.get("state") or [None])[0]
+            if len(params.get("code", [])) > 1 or len(params.get("state", [])) > 1:
+                # Ambiguous callback: reject like an unknown state, so no
+                # attempt is consumed and the listener keeps serving.
+                state = None
             try:
                 location = await complete(code, state)
                 head = f"HTTP/1.1 302 Found\r\nLocation: {location}\r\n"
@@ -464,6 +468,10 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
         request: Request, code: str | None = None, state: str | None = None
     ) -> Response:
         logger.info("Claude OAuth callback received")
+        query = request.query_params
+        if len(query.getlist("code")) > 1 or len(query.getlist("state")) > 1:
+            # Ambiguous callback: reject before selecting or consuming any attempt.
+            return _html_error("Invalid or expired sign-in state.")
         app = request.app
         # The returned code may be {code}#{state}: split and use both parts.
         if code:
