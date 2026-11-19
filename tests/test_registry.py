@@ -146,23 +146,28 @@ class TestManualAccounts:
         assert not (config / "accounts.json").exists()
         assert not (config / "labels.json").exists()
 
-    def test_add_account_drops_stale_label_for_new_id(self, tmp_path, monkeypatch):
+    def test_add_account_never_reuses_an_id_with_a_stored_label(self, tmp_path, monkeypatch):
         from ai_usage_monitor import registry as registry_module
 
         registry = make_registry(tmp_path, claude=True)
         registry.set_label(AUTO_CLAUDE_ID, "Keep me")
         labels = tmp_path / "config" / "labels.json"
-        account_id = "openai_org-deadbeef"
+        stale_id = "openai_org-deadbeef"
         expected = {AUTO_CLAUDE_ID: "Keep me"}
-        labels.write_text(json.dumps({**expected, account_id: "Old org"}), encoding="utf-8")
-        monkeypatch.setattr(registry_module.uuid, "uuid4", lambda: SimpleNamespace(hex="deadbeef"))
+        labels.write_text(json.dumps({**expected, stale_id: "Old org"}), encoding="utf-8")
+        hexes = iter(["deadbeef", "cafef00d"])
+        monkeypatch.setattr(
+            registry_module.uuid, "uuid4", lambda: SimpleNamespace(hex=next(hexes, "0123456789abcdef"))
+        )
 
         account = registry.add_account(ProviderKind.openai_org)
 
-        assert account.id == account_id
+        # The id with a stored (orphaned) name is skipped, not reused.
+        assert account.id == "openai_org-cafef00d"
         info = registry.get_info(account.id)
         assert (info.label, info.default_label, info.custom_label) == ("openai_org", "openai_org", False)
-        assert json.loads(labels.read_bytes()) == expected
+        # The orphan stays hidden (it is pruned on the next labels write).
+        assert "Old org" not in {item.label for item in registry.list_infos()}
 
     def test_remove_manual_account(self, tmp_path):
         registry = make_registry(tmp_path)

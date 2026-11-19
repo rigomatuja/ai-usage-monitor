@@ -1130,3 +1130,44 @@ def test_dashboard_assets_referenced_by_index_are_served(client):
         path = urlparse(urljoin("http://testserver/", ref)).path
         response = client.get(path)
         assert response.status_code == 200, f"{ref} resolves to {path}: {response.status_code}"
+
+
+def test_recreated_account_does_not_inherit_orphaned_label(
+    client, tmp_path, monkeypatch,
+):
+    import uuid
+
+    create = {"provider": "openai_org", "label": "New account"}
+    old = client.post("/api/accounts", json=create)
+    assert old.status_code == 201
+    old_id = old.json()["id"]
+    headers = {"Origin": "http://localhost:61524"}
+    assert client.patch(
+        f"/api/accounts/{old_id}", headers=headers, json={"label": "Café privé"},
+    ).status_code == 200
+
+    labels = tmp_path / "config" / "labels.json"
+    replace = os.replace
+
+    def deny_label_replace(source, target):
+        if target == labels:
+            raise PermissionError("labels replacement denied")
+        return replace(source, target)
+
+    monkeypatch.setattr(os, "replace", deny_label_replace)
+    assert client.delete(f"/api/accounts/{old_id}").status_code == 204
+    assert "Café privé" not in client.get("/api/accounts").text
+
+    colliding_uuid = uuid.UUID(old_id.rsplit("-", 1)[1] + "0" * 24)
+    uuid4 = uuid.uuid4
+    candidates = iter([colliding_uuid])
+    monkeypatch.setattr(uuid, "uuid4", lambda: next(candidates, None) or uuid4())
+
+    new = client.post("/api/accounts", json=create)
+    assert new.status_code == 201
+    info = new.json()
+    listing = client.get("/api/accounts").json()
+    persisted = next(row for row in listing if row["id"] == info["id"])
+    for row in (info, persisted):
+        assert row["label"] == row["default_label"] == "New account"
+        assert row["custom_label"] is False

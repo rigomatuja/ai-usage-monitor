@@ -184,6 +184,14 @@ class AccountRegistry:
 
     # -- public API ---------------------------------------------------------
 
+    def _stored_label_ids(self) -> set[str]:
+        """Ids present in labels.json, including orphans; empty if unreadable."""
+        try:
+            raw = json.loads(self._labels_file.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            return set()
+        return set(raw) if isinstance(raw, dict) else set()
+
     def add_account(
         self,
         provider: ProviderKind,
@@ -197,14 +205,20 @@ class AccountRegistry:
         Raises ValueError for an invalid label before changing either store.
         """
         default_label = _normalize_custom_label(label or "") or provider.value
+        accounts = self._load_manual()
+        # Never reuse an id that still has a stored (possibly orphaned) name, so
+        # a new account cannot inherit a deleted account's custom label.
+        taken = {item.id for item in accounts} | self._stored_label_ids()
+        account_id = f"{provider.value}-{uuid.uuid4().hex[:8]}"
+        while account_id in taken:
+            account_id = f"{provider.value}-{uuid.uuid4().hex[:8]}"
         account = AccountConfig(
-            id=f"{provider.value}-{uuid.uuid4().hex[:8]}",
+            id=account_id,
             provider=provider,
             label=default_label,
             credentials=credentials if credentials is not None else {},
             origin=origin,
         )
-        accounts = self._load_manual()
         accounts.append(account)
         self._save_manual(accounts)
         self._clean_labels_best_effort(accounts, new_account_id=account.id)
