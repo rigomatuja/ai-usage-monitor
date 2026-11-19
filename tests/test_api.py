@@ -4,6 +4,7 @@ frontend side of the same contract)."""
 from __future__ import annotations
 
 import asyncio
+import logging
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
@@ -78,8 +79,10 @@ class TestAccountsEndpoints:
         assert body["source"] == "manual"
         assert body["platform"] == "claude"
         assert body["provider"] == "anthropic_org"
+        assert body["label"] == body["default_label"] == "Work org"
+        assert body["custom_label"] is False
         # The new account is listed and was polled immediately.
-        assert any(a["id"] == body["id"] for a in client.get("/api/accounts").json())
+        assert body in client.get("/api/accounts").json()
         usage = client.get("/api/usage").json()
         assert any(u["account_id"] == body["id"] and u["status"] == "ok"
                    for u in usage)
@@ -103,12 +106,71 @@ class TestAccountsEndpoints:
         )
         assert response.status_code == 422
 
-    def test_add_account_blank_label_is_422(self, client):
-        response = client.post(
-            "/api/accounts",
-            json={"provider": "openai_org", "label": "", "credentials": {}},
+    @pytest.mark.parametrize("fields", [{}, {"label": ""}, {"label": "   "}])
+    def test_add_account_missing_or_blank_label_uses_default(self, client, fields):
+        response = client.post("/api/accounts", json={"provider": "openai_org", **fields})
+        assert response.status_code == 201
+        body = response.json()
+        assert body["label"] == body["default_label"] == "openai_org"
+        assert body["custom_label"] is False
+        assert body in client.get("/api/accounts").json()
+
+    @pytest.mark.parametrize("clear", [None, "", " \t "])
+    def test_rename_auto_and_clear_to_default(self, client, clear):
+        before, = client.get("/api/accounts").json()
+        assert before == {
+            "id": "auto-chatgpt-personal",
+            "label": "ChatGPT (local login)",
+            "default_label": "ChatGPT (local login)",
+            "custom_label": False,
+            "provider": "chatgpt_personal",
+            "platform": "openai",
+            "source": "auto",
+        }
+        path = f"/api/accounts/{before['id']}"
+        renamed = {**before, "label": "Personal", "custom_label": True}
+        response = client.patch(path, json={"label": " Personal "}, headers=DASHBOARD_HEADERS)
+        assert (response.status_code, response.json()) == (200, renamed)
+        assert client.get("/api/accounts").json() == [renamed]
+
+        response = client.patch(path, json={"label": clear}, headers=DASHBOARD_HEADERS)
+        assert (response.status_code, response.json()) == (200, before)
+        assert client.get("/api/accounts").json() == [before]
+        assert client.get("/api/usage").json() == []
+
+    def test_rename_manual_accepts_80_characters_after_trimming(self, client):
+        original = client.post("/api/accounts", json={"provider": "openai_org"}).json()
+        before = client.get("/api/accounts").json()
+        usage_before = client.get("/api/usage").json()
+        name = "x" * 80
+        expected = {**original, "label": name, "custom_label": True}
+        response = client.patch(
+            f"/api/accounts/{original['id']}", json={"label": f" {name} "},
+            headers={"Origin": "http://localhost:61524"},
         )
-        assert response.status_code == 422
+        assert (response.status_code, response.json()) == (200, expected)
+        assert client.get("/api/accounts").json() == [before[0], expected]
+        assert client.get("/api/usage").json() == usage_before
+
+    @pytest.mark.parametrize("account_id, label, headers, status, detail", [
+        ("auto-chatgpt-personal", "x" * 81, {"Origin": "http://127.0.0.1:61524"},
+         422, "label must be at most 80 characters"),
+        ("unknown", "Work", {"Origin": "http://127.0.0.1:61524"}, 404, "unknown account"),
+        ("auto-chatgpt-personal", "Work", {}, 403, "Cross-origin account rename denied"),
+        ("auto-chatgpt-personal", "Work", {"Origin": "http://foreign.invalid"},
+         403, "Cross-origin account rename denied"),
+        ("auto-chatgpt-personal", "Work", {"Origin": "http://localhost:61524", "Sec-Fetch-Site": "cross-site"},
+         403, "Cross-origin account rename denied"),
+    ])
+    def test_rejected_rename_leaves_accounts_and_usage_unchanged(
+        self, client, account_id, label, headers, status, detail,
+    ):
+        accounts = client.get("/api/accounts").json()
+        usage = client.get("/api/usage").json()
+        response = client.patch(f"/api/accounts/{account_id}", json={"label": label}, headers=headers)
+        assert (response.status_code, response.json()) == (status, {"detail": detail})
+        assert client.get("/api/accounts").json() == accounts
+        assert client.get("/api/usage").json() == usage
 
     def test_delete_manual_account_returns_204(self, client):
         body = client.post(
@@ -421,7 +483,8 @@ class TestOAuthLogin:
 
 
 class TestClaudeCallback:
-    def test_happy_path_creates_manual_account_and_polls(self, oauth_env):
+    @pytest.mark.parametrize("callback", ["/callback", "/api/oauth/claude/callback"])
+    def test_happy_path_creates_manual_account_and_polls(self, oauth_env, callback, caplog):
         client = oauth_env.client
         assert client.get("/api/oauth/attempts/unknown").status_code == 404
         login = client.post("/api/oauth/claude_personal/login")
@@ -429,10 +492,10 @@ class TestClaudeCallback:
         assert client.get(attempt).json() == {"status": "pending"}
         state = oauth_env.claude.authorize_calls[0][1]
 
-        response = oauth_env.client.get(
-            "/api/oauth/claude/callback",
-            params={"code": "auth-code", "state": state},
-        )
+        with caplog.at_level(logging.INFO, logger="ai_usage_monitor.api"):
+            response = oauth_env.client.get(
+                callback, params={"code": "auth-code", "state": state, "extra": "query-marker"},
+            )
 
         assert response.status_code == 200
         assert "text/html" in response.headers["content-type"]
@@ -457,6 +520,7 @@ class TestClaudeCallback:
             "email": "user@example.com",
         }
         assert config.origin == "oauth"
+        assert _api_info_messages(caplog) == ["Claude OAuth callback received"]
         # The new account was polled immediately.
         usage = oauth_env.client.get("/api/usage").json()
         assert any(
@@ -769,20 +833,25 @@ async def test_chatgpt_listener_stops_when_last_pending_attempt_expires(oauth_en
             await asyncio.gather(task, return_exceptions=True)
 
 
+def _api_info_messages(caplog):
+    return [record.getMessage() for record in caplog.records
+            if record.name == "ai_usage_monitor.api" and record.levelno == logging.INFO]
+
+
 class TestChatGPTCompletion:
     """The temporary listener's completion callback mirrors the Claude
     callback: exchange, add account, poll once, redirect to the app origin."""
 
-    async def test_completion_adds_account_and_redirects_to_origin(
-        self, oauth_env
-    ):
+    async def test_completion_adds_account_and_redirects_to_origin(self, oauth_env, caplog):
         oauth_env.client.post("/api/oauth/chatgpt_personal/login")
         state = oauth_env.chatgpt.authorize_calls[0][1]
         handler = oauth_env.listener_handlers[0][1]
 
-        location = await handler("auth-code", state)
+        with caplog.at_level(logging.INFO, logger="ai_usage_monitor.api"):
+            location = await handler("auth-code", state)
 
         assert location == "http://127.0.0.1:61524/"
+        assert _api_info_messages(caplog) == ["ChatGPT OAuth callback received"]
         infos = oauth_env.registry.list_infos()
         assert [i.provider for i in infos] == [ProviderKind.chatgpt_personal]
         assert infos[0].label == "gpt@example.com"

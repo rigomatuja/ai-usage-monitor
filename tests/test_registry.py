@@ -169,6 +169,48 @@ class TestManualAccounts:
         assert a.id != b.id
 
 
+class TestCustomLabels:
+    def test_labels_persist_for_auto_and_manual_accounts(self, tmp_path):
+        registry = make_registry(tmp_path, claude=True)
+        manual = registry.add_account(ProviderKind.openai_org, "Original", {})
+        registry.set_label(AUTO_CLAUDE_ID, "  Personal  ")
+        registry.set_label(manual.id, "Work")
+
+        labels_path = tmp_path / "config" / "labels.json"
+        assert stat.S_IMODE(labels_path.stat().st_mode) == 0o600
+        reloaded = AccountRegistry(
+            config_dir=tmp_path / "config",
+            claude_credentials_path=tmp_path / "home" / ".claude" / ".credentials.json",
+            codex_auth_path=tmp_path / "home" / ".codex" / "auth.json",
+        )
+        assert [(i.id, i.label, i.default_label, i.custom_label) for i in reloaded.list_infos()] == [
+            (AUTO_CLAUDE_ID, "Personal", "Claude (local login)", True),
+            (manual.id, "Work", "Original", True),
+        ]
+
+    def test_removing_manual_account_drops_only_its_custom_label(self, tmp_path):
+        registry = make_registry(tmp_path, claude=True)
+        manual = registry.add_account(ProviderKind.openai_org, credentials={})
+        registry.set_label(AUTO_CLAUDE_ID, "Personal")
+        registry.set_label(manual.id, "Work")
+
+        registry.remove_account(manual.id)
+
+        assert [(i.id, i.label) for i in registry.list_infos()] == [(AUTO_CLAUDE_ID, "Personal")]
+        path = tmp_path / "config" / "labels.json"
+        assert json.loads(path.read_text(encoding="utf-8")) == {AUTO_CLAUDE_ID: "Personal"}
+
+    def test_set_label_rejects_invalid_length_and_unknown_account(self, tmp_path):
+        registry = make_registry(tmp_path, claude=True)
+        before = registry.list_infos()
+        with pytest.raises(ValueError):
+            registry.set_label(AUTO_CLAUDE_ID, "a" * 81)
+        with pytest.raises(KeyError):
+            registry.set_label(AUTO_CHATGPT_ID, "Undetected")
+        assert registry.list_infos() == before
+        assert not (tmp_path / "config" / "labels.json").exists()
+
+
 class TestUpdateCredentials:
     NEW_CREDENTIALS = {
         "access_token": "new-at",

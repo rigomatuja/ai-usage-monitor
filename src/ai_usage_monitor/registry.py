@@ -2,7 +2,8 @@
 
 Auto accounts are derived from the presence of local CLI login files; manual
 accounts are persisted as JSON under the user config directory with 0600
-permissions (they may contain credentials).
+permissions (they may contain credentials). Custom labels for either kind of
+account are stored separately with the same permissions.
 """
 
 from __future__ import annotations
@@ -34,6 +35,10 @@ class AccountError(Exception):
     """A manual account operation failed (e.g. removing an auto account)."""
 
 
+class InvalidAccountLabel(ValueError):
+    """A custom label violates the label length limit."""
+
+
 class AccountRegistry:
     """Registry of auto-detected and manual accounts."""
 
@@ -45,6 +50,7 @@ class AccountRegistry:
     ) -> None:
         self._config_dir = config_dir or Path(user_config_dir("ai-usage-monitor"))
         self._accounts_file = self._config_dir / "accounts.json"
+        self._labels_file = self._config_dir / "labels.json"
         self._claude_path = claude_credentials_path or (
             Path.home() / CLAUDE_CREDENTIALS_FILENAME
         )
@@ -89,11 +95,23 @@ class AccountRegistry:
         return [AccountConfig.model_validate(item) for item in raw]
 
     def _save_manual(self, accounts: list[AccountConfig]) -> None:
+        self._save_json(self._accounts_file, [account.model_dump(mode="json") for account in accounts])
+
+    def _load_labels(self) -> dict[str, str]:
+        try:
+            raw = json.loads(self._labels_file.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        return {key: value for key, value in raw.items() if isinstance(value, str) and value}
+
+    def _save_json(self, path: Path, data: list[dict] | dict[str, str]) -> None:
         self._config_dir.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps([account.model_dump(mode="json") for account in accounts], indent=2) + "\n"
+        payload = json.dumps(data, indent=2) + "\n"
         # Write privately beside the target so an interrupted write cannot
         # truncate the live store and replacement stays on the same filesystem.
-        temp = self._accounts_file.with_name(f".tmp-{uuid.uuid4().hex}-{self._accounts_file.name}")
+        temp = path.with_name(f".tmp-{uuid.uuid4().hex}-{path.name}")
         fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             try:
@@ -104,7 +122,7 @@ class AccountRegistry:
                     os.fsync(fd)
             finally:
                 os.close(fd)
-            os.replace(temp, self._accounts_file)
+            os.replace(temp, path)
         except BaseException:
             temp.unlink(missing_ok=True)
             raise
@@ -114,8 +132,8 @@ class AccountRegistry:
     def add_account(
         self,
         provider: ProviderKind,
-        label: str,
-        credentials: dict[str, str],
+        label: str | None = None,
+        credentials: dict[str, str] | None = None,
         *,
         origin: Literal["manual", "oauth"] = "manual",
     ) -> AccountConfig:
@@ -123,14 +141,35 @@ class AccountRegistry:
         account = AccountConfig(
             id=f"{provider.value}-{uuid.uuid4().hex[:8]}",
             provider=provider,
-            label=label.strip() or provider.value,
-            credentials=credentials,
+            label=(label or "").strip() or provider.value,
+            credentials=credentials if credentials is not None else {},
             origin=origin,
         )
         accounts = self._load_manual()
         accounts.append(account)
         self._save_manual(accounts)
         return account
+
+    def set_label(self, account_id: str, label: str | None) -> AccountInfo:
+        """Set or clear a display name without changing the account config."""
+        account = self.get_config(account_id)
+        if account is None:
+            raise KeyError(account_id)
+        label = (label or "").strip()
+        if len(label) > 80:
+            raise InvalidAccountLabel("label must be at most 80 characters")
+        labels = self._load_labels()
+        if label:
+            labels[account_id] = label
+            self._save_json(self._labels_file, labels)
+        else:
+            self._drop_label(account_id, labels)
+        return self._account_info(account, labels)
+
+    def _drop_label(self, account_id: str, labels: dict[str, str]) -> None:
+        if account_id in labels:
+            del labels[account_id]
+            self._save_json(self._labels_file, labels)
 
     def remove_account(self, account_id: str) -> None:
         """Remove a manual account. Raises AccountError for auto accounts,
@@ -145,6 +184,7 @@ class AccountRegistry:
         if len(remaining) == len(accounts):
             raise KeyError(account_id)
         self._save_manual(remaining)
+        self._drop_label(account_id, self._load_labels())
 
     def update_credentials(self, account_id: str, credentials: dict[str, str]) -> None:
         """Replace the stored credentials of a manual account and persist
@@ -175,17 +215,26 @@ class AccountRegistry:
                 return account
         return None
 
+    def get_info(self, account_id: str) -> AccountInfo:
+        account = self.get_config(account_id)
+        if account is None:
+            raise KeyError(account_id)
+        return self._account_info(account, self._load_labels())
+
     def list_infos(self) -> list[AccountInfo]:
-        return [
-            AccountInfo(
-                id=account.id,
-                label=account.label,
-                provider=account.provider,
-                platform=PROVIDER_PLATFORMS[account.provider],
-                source="auto" if self.is_auto(account.id) else "manual",
-            )
-            for account in self.iter_configs()
-        ]
+        labels = self._load_labels()
+        return [self._account_info(account, labels) for account in self.iter_configs()]
+
+    def _account_info(self, account: AccountConfig, labels: dict[str, str]) -> AccountInfo:
+        return AccountInfo(
+            id=account.id,
+            label=labels.get(account.id, account.label),
+            default_label=account.label,
+            custom_label=account.id in labels,
+            provider=account.provider,
+            platform=PROVIDER_PLATFORMS[account.provider],
+            source="auto" if self.is_auto(account.id) else "manual",
+        )
 
 
 PROVIDER_CLASSES: dict[ProviderKind, str] = {

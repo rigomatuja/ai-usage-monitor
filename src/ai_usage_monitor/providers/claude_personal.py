@@ -7,8 +7,8 @@ Rules (odd/tasks/v1-web-monitor.md):
 - Never refresh tokens and never write to the credentials file: the Claude CLI
   owns the refresh flow, and racing it desynchronizes the CLI.
 - Percent values from the endpoint are already 0-100; never rescale.
-- Absent/unknown fields degrade to omitted windows, never errors; errors are
-  raised as ``ProviderError`` only when the account cannot be polled at all.
+- Absent/unknown fields degrade to omitted windows, except that an unreported
+  session is shown as inactive. ``ProviderError`` means polling failed.
 """
 
 from __future__ import annotations
@@ -135,8 +135,23 @@ class ClaudePersonalProvider(UsageProvider):
     ) -> list[UsageWindow]:
         limits = payload.get("limits")
         if isinstance(limits, list) and limits:
-            return self._parse_limits(limits, subscription_type)
-        return self._parse_top_level(payload, subscription_type)
+            windows = self._parse_limits(limits, subscription_type)
+            has_session = any(
+                isinstance(entry, dict) and entry.get("kind") == "session"
+                for entry in limits
+            )
+        else:
+            windows = self._parse_top_level(payload, subscription_type)
+            has_session = False
+        if not has_session and payload.get("five_hour") is None:
+            kind = WindowKind.five_hour
+            detail = "No active session"
+            if subscription_type:
+                detail = f"{subscription_type} · {detail}"
+            windows.append(
+                UsageWindow(kind=kind, label=_WINDOW_KINDS[kind], used_percent=0.0, detail=detail)
+            )
+        return sorted(windows, key=lambda window: window.kind != WindowKind.five_hour)
 
     def _parse_limits(
         self, limits: list[Any], subscription_type: str | None
