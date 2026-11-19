@@ -18,7 +18,6 @@ from ai_usage_monitor.registry import AccountRegistry
 logger = logging.getLogger(__name__)
 
 HTTP_TIMEOUT_SECONDS = 30.0
-REFRESH_DEADLINE_SECONDS = 30.0
 POLL_INTERVAL_SECONDS = 300.0
 ROTATION_RETRY_INTERVAL_SECONDS = 30
 
@@ -66,7 +65,6 @@ class UsagePoller:
         interval: float = POLL_INTERVAL_SECONDS,
         refresh_fn: Callable | None = None,
         should_refresh: Callable | None = None,
-        refresh_deadline: float = REFRESH_DEADLINE_SECONDS,
     ) -> None:
         from ai_usage_monitor.registry import default_provider_factory
 
@@ -75,7 +73,6 @@ class UsagePoller:
         self._interval = interval
         self._refresh_fn = refresh_fn or _default_refresh_fn
         self._should_refresh = should_refresh or _default_should_refresh
-        self._refresh_deadline = refresh_deadline
         self._snapshots: dict[str, UsageSnapshot] = {}
         self._last_good_windows: dict[str, list[UsageWindow]] = {}
         self._unpersisted: dict[str, dict[str, str]] = {}
@@ -119,10 +116,11 @@ class UsagePoller:
         return await asyncio.shield(task)
 
     async def _rotate(self, account_id, provider, credentials, http) -> dict[str, str] | None:
+        # No whole-operation deadline on purpose: providers rotate refresh tokens,
+        # so abandoning a refresh the provider already committed would lose the
+        # only valid token. httpx per-phase timeouts still bound stalled I/O.
         try:
-            refreshed = await asyncio.wait_for(
-                self._refresh_fn(http, provider, credentials), self._refresh_deadline
-            )
+            refreshed = await self._refresh_fn(http, provider, credentials)
         except Exception as exc:
             logger.warning("token refresh failed for %s: %s", account_id, exc)
             return None

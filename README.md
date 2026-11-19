@@ -55,6 +55,17 @@ logins are never refreshed or written.
 Notes: the ChatGPT flow uses a temporary local listener on port 1455 (fixed
 by OpenAI's app registration); if that port is busy the login returns an
 error. Claude's callback lands on the app's own port (default 61524).
+Several sign-ins can be pending at once; each completes independently, and
+pending sign-ins expire after 10 minutes. Login requests are accepted only
+from the dashboard's own origin.
+
+Known limitation (rotating refresh tokens): when a provider rotates a
+refresh token, the old one stops working as soon as the provider processes
+the refresh. The app never abandons an in-flight refresh (shutdown waits for
+it) and retries saving rotated tokens every 30 seconds, but if the process is
+killed while a refresh response is still in flight, the new token can be
+lost. In that case the account shows an error: sign in again with the same
+button.
 
 ### Manual API keys
 

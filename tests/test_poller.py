@@ -549,20 +549,13 @@ class TestPrefetchRefresh:
                 rotation.cancel()
                 await asyncio.gather(rotation, return_exceptions=True)
 
-    @pytest.mark.parametrize("hang", [False, True], ids=["rejected", "deadline"])
     async def test_refresh_failure_proceeds_with_existing_token(
-        self, setup, http, fake_windows, caplog, hang
+        self, setup, http, fake_windows, caplog
     ):
         registry, _ = setup
         account = self._add_oauth_account(registry)
-        cancelled = asyncio.Event()
 
         async def refresh(http_arg, provider, credentials):
-            if hang:
-                try:
-                    await asyncio.Event().wait()
-                finally:
-                    cancelled.set()
             raise OAuthError("refresh rejected by provider")
 
         seen = []
@@ -576,12 +569,10 @@ class TestPrefetchRefresh:
             provider_factory=factory,
             refresh_fn=refresh,
             should_refresh=lambda credentials: True,
-            refresh_deadline=0.01,
         )
 
         with caplog.at_level(logging.WARNING):
             snapshot = await asyncio.wait_for(poller.poll_account(account.id, http), 0.2)
-        assert cancelled.is_set() == hang
 
         # Fetch still happened, with the existing access token.
         assert snapshot.status == "ok"
