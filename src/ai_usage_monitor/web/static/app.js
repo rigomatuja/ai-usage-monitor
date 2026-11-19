@@ -234,7 +234,9 @@ async function loadAccounts() {
   const result = res?.ok ? await res.json().catch(() => null) : null;
   if (pendingOauth !== attempt) return;
   if (result?.status === "completed") clearOauthStatus();
-  if (result?.status === "failed") showOauthError(res.headers.get("X-OAuth-Error"));
+  if (result?.status === "failed" || result?.status === "expired") {
+    showOauthError(res.headers.get("X-OAuth-Error"));
+  }
 }
 
 async function loadUsage() {
@@ -326,7 +328,7 @@ async function onAddSubmit(event) {
 
 /* --- OAuth sign in ------------------------------------------------------------ */
 
-// POST /api/oauth/{provider}/login -> 200 {authorize_url, attempt_id}; 404 unknown provider.
+// Dashboard-origin POST -> 200 {authorize_url, attempt_id}; 404 unknown provider.
 // The authorize URL comes from the server; app.js never hardcodes one.
 const OAUTH_LOGIN_PATHS = {
   claude_personal: "/api/oauth/claude_personal/login",

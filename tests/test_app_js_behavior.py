@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.mark.parametrize("scenario", [
     "blocked", "unchanged", "unrelated", "auto", "replacement", "dismiss",
-    "restart", "unblocked", "same-provider",
+    "restart", "unblocked", "same-provider", "failed", "expired",
 ])
 def test_oauth_waiting_status(scenario):
     node = shutil.which("node")

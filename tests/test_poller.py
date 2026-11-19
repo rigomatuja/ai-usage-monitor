@@ -489,6 +489,8 @@ class TestPrefetchRefresh:
             order.append("final flush")
             return ["unsaved-account"]
 
+        drain = AsyncMock(wraps=poller.drain_rotations)
+        monkeypatch.setattr(poller, "drain_rotations", drain)
         monkeypatch.setattr(poller, "run_flush_loop", retry)
         monkeypatch.setattr(poller, "flush_unpersisted", flush)
         app = create_app(registry=registry, poller=poller)
@@ -499,6 +501,49 @@ class TestPrefetchRefresh:
 
         assert order == ["retry started", "retry cancelled", "final flush"]
         assert caplog.messages == ["Rotated credentials unsaved at shutdown for unsaved-account"]
+        drain.assert_awaited_once()
+        assert drain.await_args.args[0] >= app.state.http.timeout.read
+
+    async def test_shutdown_persists_rotation_slower_than_ten_seconds(self, setup, monkeypatch, tmp_path):
+        registry, _ = setup
+        started = asyncio.Future()
+        draining = asyncio.Event()
+        scale = 0.01
+
+        async def rotate(http, *_):
+            started.set_result(asyncio.current_task())
+            await draining.wait()
+            await asyncio.sleep(12 * scale)
+            assert not http.is_closed
+            return self.ROTATED
+
+        poller = UsagePoller(registry, lambda c: FakeProvider(c.credentials), interval=0,
+                             refresh_fn=rotate)
+        drain = poller.drain_rotations
+
+        async def scaled_drain(timeout):
+            draining.set()
+            await drain(timeout * scale)
+
+        monkeypatch.setattr(poller, "drain_rotations", scaled_drain)
+        app = create_app(registry=registry, poller=poller)
+        rotation = None
+        try:
+            async with app.router.lifespan_context(app):
+                account = self._add_oauth_account(registry)
+                rotation = await asyncio.wait_for(started, 1)
+            reloaded = AccountRegistry(
+                config_dir=tmp_path / "config",
+                claude_credentials_path=tmp_path / "home/.claude/.credentials.json",
+                codex_auth_path=tmp_path / "home/.codex/auth.json",
+            )
+            assert reloaded.get_config(account.id).credentials == dict(
+                self.ROTATED, expires_at="1893456000000"
+            )
+        finally:
+            if rotation is not None and not rotation.done():
+                rotation.cancel()
+                await asyncio.gather(rotation, return_exceptions=True)
 
     async def test_refresh_failure_proceeds_with_existing_token(
         self, setup, http, fake_windows, caplog

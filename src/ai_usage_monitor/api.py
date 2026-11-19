@@ -22,7 +22,7 @@ from ai_usage_monitor.models import (
     UsageSnapshot,
 )
 from ai_usage_monitor.registry import AccountError, AccountRegistry
-from ai_usage_monitor.poller import UsagePoller
+from ai_usage_monitor.poller import HTTP_TIMEOUT_SECONDS, UsagePoller
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,11 @@ _CHATGPT = ProviderKind.chatgpt_personal.value
 _OAUTH_PROVIDERS = (_CLAUDE, _CHATGPT)
 _CHATGPT_CALLBACK_PATH = "/auth/callback"
 CHATGPT_LISTENER_TIMEOUT_SECONDS = 600
+_FINISHED_ATTEMPT_LIMIT = 50
+_ATTEMPT_ERRORS = {
+    "failed": "Sign-in failed. Please try signing in again.",
+    "expired": "Sign-in expired. Please try signing in again.",
+}
 
 
 class OAuthCallbackError(Exception):
@@ -74,6 +79,8 @@ class _ListenerDeadline:
     def __init__(self, timeout: float, clock: Callable[[], float]) -> None:
         self._timeout = timeout
         self._clock = clock
+        self.changed = asyncio.Event()
+        self.closed = False
         self.extend()
 
     def extend(self) -> None:
@@ -90,13 +97,11 @@ async def _start_chatgpt_listener(
     has_pending: Callable[[], bool],
 ) -> asyncio.Task:
     """Temporary loopback-only callback listener for the ChatGPT OAuth flow
-    (redirect_uri host is a FIXED port in the client allow-list).
+    (redirect_uri uses a fixed port in the client allow-list).
 
-    Binds 127.0.0.1:<port> and serves GET /auth/callback until a callback
-    consumes the pending session or the deadline expires.
-    Returns the serving task right after binding succeeds so the
-    login request does not block; raises OSError when the port is taken."""
-    done = asyncio.Event()
+    Binds 127.0.0.1:<port> and serves GET /auth/callback while ChatGPT
+    attempts are pending and the deadline has not passed. Returns the serving
+    task as soon as binding succeeds; raises OSError when the port is taken."""
 
     async def handle(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -147,25 +152,23 @@ async def _start_chatgpt_listener(
         finally:
             writer.close()
             if session_consumed:
-                done.set()
+                deadline.changed.set()
 
     server = await asyncio.start_server(handle, "127.0.0.1", port)
 
     async def serve() -> None:
         async with server:
-            while True:
-                if done.is_set():
-                    if not has_pending():
-                        break
-                    done.clear()
-                remaining = deadline.remaining()
-                if remaining <= 0:
-                    break
-                try:
-                    await asyncio.wait_for(done.wait(), remaining)
-                except TimeoutError:
-                    # A new login may have extended the deadline during this wait.
-                    continue
+            try:
+                while has_pending() and (remaining := deadline.remaining()) > 0:
+                    deadline.changed.clear()
+                    try:
+                        await asyncio.wait_for(deadline.changed.wait(), remaining)
+                    except TimeoutError:
+                        # Recheck: a login may have extended the deadline.
+                        continue
+            finally:
+                # The socket can close before the task finishes its connections.
+                deadline.closed = True
 
     return asyncio.create_task(serve(), name="oauth-chatgpt-callback-listener")
 
@@ -185,7 +188,7 @@ def build_router(registry: AccountRegistry, poller: UsagePoller) -> APIRouter:
         http = getattr(request.app.state, "http", None)
         if http is not None:
             return http
-        return httpx.AsyncClient(timeout=30.0)
+        return httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS)
 
     def _is_app_client(request: Request, http: httpx.AsyncClient) -> bool:
         return http is getattr(request.app.state, "http", None)
@@ -244,11 +247,10 @@ def build_router(registry: AccountRegistry, poller: UsagePoller) -> APIRouter:
 
 
 def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
-    """OAuth login routes: POST /api/oauth/{provider}/login starts a pending
-    PKCE/state session (and, for ChatGPT, a temporary callback listener),
-    GET /api/oauth/claude/callback completes the Claude flow on the app port.
-    OAuth clients and pending-session state live on ``app.state`` so tests
-    can inject fakes."""
+    """Dashboard-origin login POSTs start independent PKCE/state attempts.
+
+    ChatGPT shares a temporary callback listener; Claude callbacks use the
+    app port. Clients and pending attempts live on ``app.state``."""
     router = APIRouter()
 
     def _oauth_clients(app: FastAPI) -> dict:
@@ -268,21 +270,49 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
         if http is not None:
             yield http
             return
-        async with httpx.AsyncClient(timeout=30.0) as owned:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as owned:
             yield owned
 
-    def _mark_attempt(app, pending, status):
+    def _mark_attempt(app: FastAPI, pending: dict, status: str) -> None:
         attempts = app.state.oauth_attempts
-        if pending and pending.get("attempt_id") in attempts:
-            attempts[pending["attempt_id"]] = status
+        attempt_id = pending["attempt_id"]
+        # Move the entry to the end so eviction follows completion order.
+        attempts.pop(attempt_id)
+        attempts[attempt_id] = status
+        finished = [key for key, value in attempts.items() if value != "pending"]
+        for key in finished[:-_FINISHED_ATTEMPT_LIMIT]:
+            del attempts[key]
+
+    def _pop_pending(app: FastAPI, state: str) -> dict:
+        app.state.oauth_pending_timers.pop(state).cancel()
+        return app.state.oauth_pending.pop(state)
+
+    def _expire_pending(app: FastAPI, state: str) -> None:
+        pending = _pop_pending(app, state)
+        _mark_attempt(app, pending, "expired")
+        if pending["provider"] == _CHATGPT:
+            app.state.oauth_listener_deadline.changed.set()
+
+    def _consume_pending(
+        app: FastAPI, provider: str, code: str | None, state: str | None
+    ) -> dict:
+        pending = app.state.oauth_pending.get(state)
+        if pending is None or pending["provider"] != provider:
+            raise _UnconsumedOAuthCallbackError("invalid state parameter")
+        if monotonic() - pending["created_at"] >= CHATGPT_LISTENER_TIMEOUT_SECONDS:
+            _expire_pending(app, state)
+            raise _UnconsumedOAuthCallbackError("expired state parameter")
+        if not code:
+            raise _UnconsumedOAuthCallbackError("missing authorization code")
+        return _pop_pending(app, state)
 
     @router.get("/api/oauth/attempts/{attempt_id}")
     async def oauth_attempt(attempt_id: str, request: Request, response: Response) -> dict[str, str]:
         status = request.app.state.oauth_attempts.get(attempt_id)
         if status is None:
             raise HTTPException(status_code=404, detail="unknown oauth attempt")
-        if status == "failed":
-            response.headers["X-OAuth-Error"] = "Sign-in failed. Please try signing in again."
+        if status in _ATTEMPT_ERRORS:
+            response.headers["X-OAuth-Error"] = _ATTEMPT_ERRORS[status]
         return {"status": status}
 
     def _chatgpt_completion(app: FastAPI):
@@ -291,23 +321,12 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
         the redirect target for the browser (the app origin)."""
 
         async def complete(code: str | None, state: str | None) -> str:
-            pending = app.state.oauth_pending.get(_CHATGPT)
-            if pending is None:
-                raise _UnconsumedOAuthCallbackError("no pending sign-in session")
-            if (
-                not code
-                or not state
-                or not secrets.compare_digest(
-                    state.encode(), pending["state"].encode()
-                )
-            ):
-                raise _UnconsumedOAuthCallbackError("invalid state parameter")
-            app.state.oauth_pending.pop(_CHATGPT, None)
+            pending = _consume_pending(app, _CHATGPT, code, state)
             client = _oauth_clients(app)[_CHATGPT]
             async with _http_for(app) as http:
                 try:
                     exchanged = await client.exchange_code(
-                        http, code, pending["verifier"], pending["state"]
+                        http, code, pending["verifier"], state
                     )
                 except Exception as exc:
                     _mark_attempt(app, pending, "failed")
@@ -331,7 +350,10 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
 
         return complete
 
-    @router.post("/api/oauth/{provider}/login")
+    @router.post(
+        "/api/oauth/{provider}/login",
+        responses={403: {"description": "Requests must originate from the dashboard"}},
+    )
     async def oauth_login(provider: str, request: Request) -> dict[str, str]:
         if provider not in _OAUTH_PROVIDERS:
             raise HTTPException(
@@ -339,9 +361,12 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
             )
         app = request.app
         origins = request.headers.getlist("origin")
-        if any(origin not in (
-            app.state.app_origin, f"http://localhost:{app.state.app_port}",
-        ) for origin in origins) or "cross-site" in request.headers.getlist("sec-fetch-site"):
+        dashboard_origins = (app.state.app_origin, f"http://localhost:{app.state.app_port}")
+        if (
+            len(origins) != 1
+            or origins[0] not in dashboard_origins
+            or "cross-site" in request.headers.getlist("sec-fetch-site")
+        ):
             raise HTTPException(status_code=403, detail="Cross-origin OAuth login denied")
         async with app.state.oauth_login_lock:
             return await _start_login(app, provider)
@@ -353,14 +378,15 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
         authorize_url = client.build_authorize_url(verifier, state)
         if provider == _CHATGPT:
             task = getattr(app.state, "oauth_listener_task", None)
-            if task is None or task.done():
+            if task is None or task.done() or app.state.oauth_listener_deadline.closed:
                 deadline = _ListenerDeadline(CHATGPT_LISTENER_TIMEOUT_SECONDS, monotonic)
                 port = app.state.oauth_callback_port
                 complete = _chatgpt_completion(app)
                 try:
                     if listener_factory is None:
                         task = await _start_chatgpt_listener(
-                            port, complete, deadline, lambda: _CHATGPT in app.state.oauth_pending
+                            port, complete, deadline,
+                            lambda: any(p["provider"] == _CHATGPT for p in app.state.oauth_pending.values()),
                         )
                     else:
                         task = await listener_factory(port, complete)
@@ -372,24 +398,19 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
                             f"{port}; it may already be in use"
                         ),
                     ) from exc
-                if task is not None:
-                    app.state.oauth_listener_task = task
-                    app.state.oauth_listener_deadline = deadline
-                    task.add_done_callback(
-                        lambda t: app.state.oauth_pending.pop(_CHATGPT, None)
-                        if t is app.state.oauth_listener_task else None
-                    )
-            else:
-                deadline = app.state.oauth_listener_deadline
-            deadline.extend()
-        # ONE pending login session per provider; a new call replaces it.
-        _mark_attempt(app, app.state.oauth_pending.get(provider), "superseded")
+                app.state.oauth_listener_task = task
+                app.state.oauth_listener_deadline = deadline
         attempt_id = secrets.token_urlsafe(16)
-        attempts = app.state.oauth_attempts
-        attempts[attempt_id] = "pending"
-        if len(attempts) > 50:
-            attempts.pop(next(iter(attempts)))
-        app.state.oauth_pending[provider] = {"verifier": verifier, "state": state, "attempt_id": attempt_id}
+        app.state.oauth_attempts[attempt_id] = "pending"
+        app.state.oauth_pending[state] = {
+            "provider": provider, "verifier": verifier, "attempt_id": attempt_id,
+            "created_at": monotonic(),
+        }
+        app.state.oauth_pending_timers[state] = asyncio.get_running_loop().call_later(
+            CHATGPT_LISTENER_TIMEOUT_SECONDS, _expire_pending, app, state
+        )
+        if provider == _CHATGPT:
+            app.state.oauth_listener_deadline.extend()
         return {"authorize_url": authorize_url, "attempt_id": attempt_id}
 
     @router.get("/api/oauth/claude/callback", include_in_schema=False)
@@ -397,24 +418,18 @@ def build_oauth_router(listener_factory: Callable | None = None) -> APIRouter:
         request: Request, code: str | None = None, state: str | None = None
     ) -> Response:
         app = request.app
-        pending = app.state.oauth_pending.get(_CLAUDE)
         # The returned code may be {code}#{state}: split and use both parts.
         if code and "#" in code and not state:
             code, _, state = code.partition("#")
-        if pending is None:
-            return _html_error("No pending sign-in session. Start the sign-in again.")
-        if (
-            not code
-            or not state
-            or not secrets.compare_digest(state.encode(), pending["state"].encode())
-        ):
+        try:
+            pending = _consume_pending(app, _CLAUDE, code, state)
+        except _UnconsumedOAuthCallbackError:
             return _html_error("Invalid or expired sign-in state.")
-        app.state.oauth_pending.pop(_CLAUDE, None)
         client = _oauth_clients(app)[_CLAUDE]
         async with _http_for(app) as http:
             try:
                 exchanged = await client.exchange_code(
-                    http, code, pending["verifier"], pending["state"]
+                    http, code, pending["verifier"], state
                 )
             except Exception:
                 # Never a stack trace, never token values.

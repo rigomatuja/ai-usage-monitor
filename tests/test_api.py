@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
@@ -190,6 +191,17 @@ CHATGPT_EXCHANGE = {
 }
 
 
+DASHBOARD_HEADERS = {"Origin": "http://127.0.0.1:61524"}
+
+
+def _state(login):
+    return parse_qs(urlsplit(login.json()["authorize_url"]).query)["state"][0]
+
+
+def _attempt(login):
+    return f"/api/oauth/attempts/{login.json()['attempt_id']}"
+
+
 @pytest.fixture
 def oauth_env(tmp_path):
     home = tmp_path / "home"
@@ -225,7 +237,7 @@ def oauth_env(tmp_path):
         oauth_listener_factory=fake_listener,
         app_port=61524,
     )
-    with TestClient(app) as client:
+    with TestClient(app, headers=DASHBOARD_HEADERS) as client:
         yield SimpleNamespace(
             client=client,
             app=app,
@@ -265,17 +277,21 @@ def test_listener_deadline_extend_resets_full_timeout():
 class TestOAuthLogin:
     @pytest.mark.parametrize("host, headers", [
         ("127.0.0.1", {"Origin": "http://foreign.invalid"}),
-        ("localhost", {"Sec-Fetch-Site": "cross-site"}),
+        ("localhost", {"Origin": "http://localhost:61524", "Sec-Fetch-Site": "cross-site"}),
+        ("127.0.0.1", {}),
     ])
     def test_cross_origin_login_preserves_pending(self, oauth_env, host, headers):
         path = "/api/oauth/claude_personal/login"
-        assert oauth_env.client.post(path, headers={"Origin": f"http://{host}:61524"}).status_code == 200
-        pending = oauth_env.app.state.oauth_pending
-        before = pending["claude_personal"].copy()
-        response = oauth_env.client.post(path, headers=headers)
+        client = oauth_env.client
+        login = client.post(path, headers={"Origin": f"http://{host}:61524"})
+        assert login.status_code == 200
+        # Build a raw request so the missing-Origin case does not inherit defaults.
+        response = client.send(httpx.Request("POST", str(login.request.url), headers=headers))
         assert (response.status_code, response.json()) == (403, {"detail": "Cross-origin OAuth login denied"})
         assert len(oauth_env.claude.authorize_calls) == 1
-        assert pending["claude_personal"] == before
+        assert client.get(_attempt(login)).json() == {"status": "pending"}
+        assert client.get("/api/accounts").json() == []
+        assert client.get("/api/oauth/claude/callback", params={"code": "auth-code", "state": _state(login)}).status_code == 200
 
     def test_claude_login_returns_authorize_url(self, oauth_env):
         response = oauth_env.client.post("/api/oauth/claude_personal/login")
@@ -284,9 +300,7 @@ class TestOAuthLogin:
         assert verifier and state
         attempt_id = response.json()["attempt_id"]
         assert attempt_id and response.json()["authorize_url"] == f"https://auth.example.com/authorize?state={state}"
-        assert oauth_env.app.state.oauth_pending["claude_personal"] == {
-            "verifier": verifier, "state": state, "attempt_id": attempt_id,
-        }
+        assert oauth_env.client.get(_attempt(response)).json() == {"status": "pending"}
 
     def test_chatgpt_login_starts_listener_on_injected_port(self, oauth_env):
         response = oauth_env.client.post("/api/oauth/chatgpt_personal/login")
@@ -302,35 +316,55 @@ class TestOAuthLogin:
         assert response.status_code == 200
         assert oauth_env.listener_handlers == []
 
-    def test_new_login_replaces_pending_session(self, oauth_env):
-        oauth_env.client.post("/api/oauth/claude_personal/login")
-        oauth_env.client.post("/api/oauth/claude_personal/login")
-        assert len(oauth_env.claude.authorize_calls) == 2
-        pending = oauth_env.app.state.oauth_pending["claude_personal"]
-        assert pending["verifier"] == oauth_env.claude.authorize_calls[-1][0]
-
-    def test_chatgpt_relogin_reuses_listener_and_replaces_session(self, oauth_env):
-        for _ in range(2):
-            response = oauth_env.client.post("/api/oauth/chatgpt_personal/login")
-            assert response.status_code == 200
-            verifier, state = oauth_env.chatgpt.authorize_calls[-1]
-            assert response.json()["authorize_url"] == f"https://auth.example.com/authorize?state={state}"
-        assert len(oauth_env.listener_handlers) == 1
-        pending = oauth_env.app.state.oauth_pending["chatgpt_personal"]
-        assert (pending["verifier"], pending["state"]) == (verifier, state)
+    def test_claude_logins_complete_independently(self, oauth_env):
+        client = oauth_env.client
+        path = "/api/oauth/claude_personal/login"
+        first, second = client.post(path), client.post(path)
+        assert first.status_code == second.status_code == 200
+        for login in (first, second):
+            assert client.get(_attempt(login)).json() == {"status": "pending"}
+            assert client.get("/api/oauth/claude/callback", params={"code": "auth-code", "state": _state(login)}).status_code == 200
+            assert client.get(_attempt(login)).json() == {"status": "completed"}
+        assert len(client.get("/api/accounts").json()) == 2
 
     async def test_concurrent_chatgpt_logins(self, oauth_env):
-        app = oauth_env.app
-        completed = []
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-            async def login():
-                completed.append(await client.post("/api/oauth/chatgpt_personal/login"))
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=oauth_env.app), base_url="http://test",
+            headers=DASHBOARD_HEADERS,
+        ) as client:
+            path = "/api/oauth/chatgpt_personal/login"
+            first, second = await asyncio.gather(client.post(path), client.post(path))
+            assert first.status_code == second.status_code == 200
+            assert len(oauth_env.listener_handlers) == 1
+            _, complete = oauth_env.listener_handlers[0]
+            assert await complete("auth-code", _state(first)) == "http://127.0.0.1:61524/"
+            assert (await client.get(_attempt(first))).json() == {"status": "completed"}
+            assert (await client.get(_attempt(second))).json() == {"status": "pending"}
+            assert [a["label"] for a in (await client.get("/api/accounts")).json()] == ["gpt@example.com"]
 
-            await asyncio.gather(login(), login())
-            assert (await client.get(f"/api/oauth/attempts/{completed[0].json()['attempt_id']}")).json() == {"status": "superseded"}
-        assert [response.status_code for response in completed] == [200, 200]
-        assert len(oauth_env.listener_handlers) == 1
-        assert app.state.oauth_pending["chatgpt_personal"]["attempt_id"] == completed[-1].json()["attempt_id"]
+    async def test_finished_history_keeps_old_pending_attempt(self, oauth_env):
+        client = oauth_env.client
+        pending = client.post("/api/oauth/chatgpt_personal/login")
+        assert pending.status_code == 200
+        finished = []
+        oauth_env.claude.fail_exchange = True
+        for _ in range(60):
+            login = client.post("/api/oauth/claude_personal/login")
+            assert login.status_code == 200
+            response = client.get("/api/oauth/claude/callback", params={"code": "auth-code", "state": _state(login)})
+            assert response.status_code == 400
+            finished.append(_attempt(login))
+        assert client.get(_attempt(pending)).json() == {"status": "pending"}
+        assert client.get("/api/accounts").json() == []
+        for path in finished[:10]:
+            assert client.get(path).status_code == 404
+        for path in finished[10:]:
+            assert client.get(path).json() == {"status": "failed"}
+        _, complete = oauth_env.listener_handlers[0]
+        assert await complete("auth-code", _state(pending)) == "http://127.0.0.1:61524/"
+        assert client.get(_attempt(pending)).json() == {"status": "completed"}
+        assert client.get(finished[10]).status_code == 404
+        assert [a["label"] for a in client.get("/api/accounts").json()] == ["gpt@example.com"]
 
     def test_chatgpt_relogin_extends_live_listener_deadline(self, oauth_env, monkeypatch):
         from ai_usage_monitor import api
@@ -377,13 +411,13 @@ class TestOAuthLogin:
             oauth_clients={"chatgpt_personal": FakeOAuthClient(CHATGPT_EXCHANGE)},
             oauth_listener_factory=busy_listener,
         )
-        pending = {"verifier": "old-verifier", "state": "old-state"}
-        app.state.oauth_pending["chatgpt_personal"] = pending
-        with TestClient(app) as client:
+        with TestClient(app, headers=DASHBOARD_HEADERS) as client:
             response = client.post("/api/oauth/chatgpt_personal/login")
-        assert response.status_code == 503
-        assert response.json() == {"detail": "could not start the local callback listener on port 1455; it may already be in use"}
-        assert app.state.oauth_pending["chatgpt_personal"] == pending
+            assert response.status_code == 503
+            assert response.json() == {"detail": "could not start the local callback listener on port 1455; it may already be in use"}
+            assert client.get("/api/accounts").json() == []
+        assert not app.state.oauth_pending
+        assert not app.state.oauth_attempts
 
 
 class TestClaudeCallback:
@@ -441,17 +475,22 @@ class TestClaudeCallback:
         assert len(oauth_env.registry.list_infos()) == 1
 
     def test_state_mismatch_is_400_html_without_tokens(self, oauth_env):
-        state = _login_claude(oauth_env)
+        client = oauth_env.client
+        claude = client.post("/api/oauth/claude_personal/login")
+        chatgpt = client.post("/api/oauth/chatgpt_personal/login")
 
-        response = oauth_env.client.get(
+        response = client.get(
             "/api/oauth/claude/callback",
-            params={"code": "auth-code", "state": "wrong-state"},
+            params={"code": "auth-code", "state": _state(chatgpt)},
         )
 
         assert response.status_code == 400
         assert "text/html" in response.headers["content-type"]
+        assert "Invalid or expired sign-in state." in response.text
         assert "sk-ant-oat01-t" not in response.text
-        assert len(oauth_env.registry.list_infos()) == 0
+        assert client.get("/api/accounts").json() == []
+        assert client.get(_attempt(claude)).json() == {"status": "pending"}
+        assert client.get(_attempt(chatgpt)).json() == {"status": "pending"}
 
     def test_missing_code_is_400_html(self, oauth_env):
         state = _login_claude(oauth_env)
@@ -463,6 +502,27 @@ class TestClaudeCallback:
         assert response.status_code == 400
         assert "text/html" in response.headers["content-type"]
         assert len(oauth_env.registry.list_infos()) == 0
+
+    def test_expired_state_does_not_consume_another_attempt(self, oauth_env, monkeypatch):
+        from ai_usage_monitor import api
+
+        now = 100
+        monkeypatch.setattr(api, "monotonic", lambda: now)
+        client = oauth_env.client
+        path = "/api/oauth/claude_personal/login"
+        first = client.post(path)
+        now += 1
+        second = client.post(path)
+        now += api.CHATGPT_LISTENER_TIMEOUT_SECONDS - 1
+        response = client.get("/api/oauth/claude/callback", params={"code": "auth-code", "state": _state(first)})
+        assert (response.status_code, "Invalid or expired sign-in state." in response.text) == (400, True)
+        expired = client.get(_attempt(first))
+        assert expired.json() == {"status": "expired"}
+        assert expired.headers["X-OAuth-Error"] == "Sign-in expired. Please try signing in again."
+        assert client.get(_attempt(second)).json() == {"status": "pending"}
+        assert client.get("/api/accounts").json() == []
+        assert oauth_env.claude.exchange_calls == []
+        assert client.get("/api/oauth/claude/callback", params={"code": "auth-code", "state": _state(second)}).status_code == 200
 
     def test_exchange_failure_is_400_html_without_tokens(self, oauth_env):
         state = _login_claude(oauth_env)
@@ -480,7 +540,7 @@ class TestClaudeCallback:
 
 
 @pytest.mark.parametrize("fail_exchange", [False, True])
-async def test_chatgpt_listener_accepts_replacement_after_stale_callback(
+async def test_chatgpt_listener_serves_both_attempts_and_rejects_unknown_state(
     oauth_env, monkeypatch, fail_exchange
 ):
     from ai_usage_monitor.app import create_app
@@ -510,31 +570,65 @@ async def test_chatgpt_listener_accepts_replacement_after_stale_callback(
             await writer.wait_closed()
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
-                                 base_url="http://test") as client:
-        for _ in range(2):
-            assert (await client.post("/api/oauth/chatgpt_personal/login")).status_code == 200
+                                 base_url="http://test", headers=DASHBOARD_HEADERS) as client:
+        path = "/api/oauth/chatgpt_personal/login"
+        first, second = await client.post(path), await client.post(path)
+        assert first.status_code == second.status_code == 200
         task = app.state.oauth_listener_task
         try:
-            (_, stale), (verifier, current) = oauth_env.chatgpt.authorize_calls
-            rejected = await callback(stale)
+            rejected = await callback("unknown-state")
             assert rejected.startswith(b"HTTP/1.1 400 Bad Request\r\n")
             assert b"Sign-in failed. Please try signing in again." in rejected
             assert (await client.get("/api/accounts")).json() == []
             assert oauth_env.chatgpt.exchange_calls == []
             assert not task.done()
-            assert app.state.oauth_pending["chatgpt_personal"]["state"] == current
+            redirect = (b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:61524/\r\n"
+                        b"Content-Length: 0\r\nConnection: close\r\n\r\n")
             oauth_env.chatgpt.fail_exchange = fail_exchange
-            result = await callback(current)
+            assert await callback(_state(first)) == (rejected if fail_exchange else redirect)
+            assert (await client.get(_attempt(first))).json() == {"status": "failed" if fail_exchange else "completed"}
+            assert (await client.get(_attempt(second))).json() == {"status": "pending"}
+            assert not task.done()
+            assert len((await client.get("/api/accounts")).json()) == (0 if fail_exchange else 1)
+            oauth_env.chatgpt.fail_exchange = False
+            assert await callback(_state(second)) == redirect
             await asyncio.wait_for(asyncio.shield(task), 2)
-            assert oauth_env.chatgpt.exchange_calls == [("auth-code", verifier, current)]
-            accounts = (await client.get("/api/accounts")).json()
-            if fail_exchange:
-                assert result == rejected
-                assert accounts == []
-            else:
-                assert result == (b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:61524/\r\n"
-                                  b"Content-Length: 0\r\nConnection: close\r\n\r\n")
-                assert [account["label"] for account in accounts] == ["gpt@example.com"]
+            assert (await client.get(_attempt(second))).json() == {"status": "completed"}
+            assert len((await client.get("/api/accounts")).json()) == (1 if fail_exchange else 2)
+            assert oauth_env.chatgpt.exchange_calls == [
+                ("auth-code", verifier, state) for verifier, state in oauth_env.chatgpt.authorize_calls
+            ]
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_chatgpt_listener_stops_when_last_pending_attempt_expires(oauth_env, monkeypatch):
+    from ai_usage_monitor import api
+    from ai_usage_monitor.app import create_app
+
+    loop = asyncio.get_running_loop()
+    real_time = loop.time
+    elapsed = 0
+    monkeypatch.setattr(loop, "time", lambda: real_time() + elapsed)
+    monkeypatch.setattr(api, "monotonic", loop.time)
+    app = create_app(registry=oauth_env.registry, poller=oauth_env.app.state.poller,
+                     start_background=False, oauth_callback_port=0,
+                     oauth_clients={"chatgpt_personal": oauth_env.chatgpt})
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                 base_url="http://test", headers=DASHBOARD_HEADERS) as client:
+        path = "/api/oauth/chatgpt_personal/login"
+        login = await client.post(path)
+        assert login.status_code == 200
+        task = app.state.oauth_listener_task
+        try:
+            assert (await client.get(_attempt(login))).json() == {"status": "pending"}
+            elapsed += api.CHATGPT_LISTENER_TIMEOUT_SECONDS + 1
+            await asyncio.wait_for(asyncio.shield(task), 2)
+            assert (await client.get(_attempt(login))).json() == {"status": "expired"}
+            assert (await client.get("/api/accounts")).json() == []
+            assert oauth_env.chatgpt.exchange_calls == []
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -595,10 +689,12 @@ class TestChatGPTCompletion:
         from ai_usage_monitor.api import OAuthCallbackError
 
         handler = _login_chatgpt(oauth_env)
-        oauth_env.app.state.oauth_pending.pop("chatgpt_personal", None)
+        state = oauth_env.chatgpt.authorize_calls[0][1]
+        await handler("auth-code", state)
 
         with pytest.raises(OAuthCallbackError):
-            await handler("auth-code", "whatever")
+            await handler("auth-code", state)
+        assert len(oauth_env.registry.list_infos()) == 1
 
     async def test_completion_exchange_failure_rejected(self, oauth_env):
         from ai_usage_monitor.api import OAuthCallbackError

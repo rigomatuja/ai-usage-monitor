@@ -18,7 +18,7 @@ from ai_usage_monitor.models import ProviderKind
 
 from ai_usage_monitor.api import build_oauth_router, build_router
 from ai_usage_monitor.oauth import ChatGPTOAuthClient, ClaudeOAuthClient
-from ai_usage_monitor.poller import POLL_INTERVAL_SECONDS, UsagePoller
+from ai_usage_monitor.poller import HTTP_TIMEOUT_SECONDS, POLL_INTERVAL_SECONDS, UsagePoller
 from ai_usage_monitor.registry import AccountRegistry
 
 STATIC_DIR = Path(__file__).parent / "web" / "static"
@@ -43,7 +43,7 @@ def create_app(
         )
 
     async def finish_rotations():
-        await poller.drain_rotations(10)
+        await poller.drain_rotations(HTTP_TIMEOUT_SECONDS + 5)
         unsaved = await poller.flush_unpersisted()
         if unsaved:
             logger.error("Rotated credentials unsaved at shutdown for %s", ", ".join(unsaved))
@@ -56,7 +56,7 @@ def create_app(
             finally:
                 await finish_rotations()
             return
-        async with httpx.AsyncClient(timeout=30.0) as http:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as http:
             app.state.http = http
             tasks = [asyncio.create_task(poller.run_flush_loop())]
             try:
@@ -103,6 +103,7 @@ def create_app(
         }
     app.state.oauth_clients = oauth_clients
     app.state.oauth_pending = {}
+    app.state.oauth_pending_timers = {}
     app.state.oauth_attempts = {}
     app.state.oauth_login_lock = asyncio.Lock()
     app.state.oauth_callback_port = oauth_callback_port

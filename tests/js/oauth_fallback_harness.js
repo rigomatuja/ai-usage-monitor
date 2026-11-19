@@ -86,7 +86,15 @@ async function main() {
     },
     async fetch(url, options) {
       if (url === `/api/oauth/attempts/attempt-${opens}`) {
-        return { ok: true, json: async () => ({ status: attemptStatus }) };
+        const messages = {
+          failed: "Sign-in failed. Please try signing in again.",
+          expired: "Sign-in expired. Please try signing in again.",
+        };
+        return {
+          ok: true,
+          headers: new Map([["X-OAuth-Error", messages[attemptStatus]]]),
+          json: async () => ({ status: attemptStatus }),
+        };
       }
       const request = requests.shift();
       assert.ok(request, `Unexpected request: ${url}`);
@@ -157,6 +165,18 @@ async function main() {
       await reload([...initial, account("manual-new")]);
       assert.equal(waiting.classList.contains("hidden"), true);
       break;
+    case "failed":
+    case "expired": {
+      assertLink();
+      attemptStatus = scenario;
+      await reload(initial);
+      assert.equal(waiting.classList.contains("hidden"), true);
+      assert.equal(waiting.textContent, "");
+      const error = elements.get("oauth-error");
+      assert.equal(error.classList.contains("hidden"), false);
+      assert.equal(error.textContent, `Sign-in ${scenario}. Please try signing in again.`);
+      break;
+    }
     case "dismiss": {
       assertLink();
       const dismiss = waiting.children.find((child) => child.tagName === "button");

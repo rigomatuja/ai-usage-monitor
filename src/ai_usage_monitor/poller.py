@@ -17,6 +17,7 @@ from ai_usage_monitor.registry import AccountRegistry
 
 logger = logging.getLogger(__name__)
 
+HTTP_TIMEOUT_SECONDS = 30.0
 POLL_INTERVAL_SECONDS = 300.0
 ROTATION_RETRY_INTERVAL_SECONDS = 30
 
