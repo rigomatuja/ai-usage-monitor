@@ -22,7 +22,7 @@ from ai_usage_monitor.models import (
 )
 from ai_usage_monitor.oauth import ChatGPTOAuthClient, ClaudeOAuthClient
 from ai_usage_monitor.poller import HTTP_TIMEOUT_SECONDS, UsagePoller
-from ai_usage_monitor.registry import AccountError, AccountRegistry, InvalidAccountLabel
+from ai_usage_monitor.registry import AccountRegistry, InvalidAccountLabel
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +218,10 @@ async def _require_rename_origin(request: Request) -> None:
     _require_dashboard_origin(request, denied_detail="Cross-origin account rename denied")
 
 
+async def _require_restore_origin(request: Request) -> None:
+    _require_dashboard_origin(request, denied_detail="Cross-origin account restore denied")
+
+
 def build_router(registry: AccountRegistry, poller: UsagePoller) -> APIRouter:
     router = APIRouter()
 
@@ -235,6 +239,10 @@ def build_router(registry: AccountRegistry, poller: UsagePoller) -> APIRouter:
     @router.get("/api/accounts")
     async def list_accounts() -> list[AccountInfo]:
         return registry.list_infos()
+
+    @router.get("/api/accounts/hidden")
+    async def list_hidden_accounts() -> list[AccountInfo]:
+        return registry.list_hidden_infos()
 
     @router.get("/api/usage")
     async def list_usage() -> list[UsageSnapshot]:
@@ -276,11 +284,20 @@ def build_router(registry: AccountRegistry, poller: UsagePoller) -> APIRouter:
     async def remove_account(account_id: str) -> Response:
         try:
             registry.remove_account(account_id)
-        except AccountError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except KeyError:
             raise HTTPException(status_code=404, detail="unknown account") from None
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @router.post(
+        "/api/accounts/{account_id}/restore",
+        dependencies=[Depends(_require_restore_origin)],
+        responses={403: {"description": "Requests must originate from the dashboard"}},
+    )
+    async def restore_account(account_id: str) -> AccountInfo:
+        try:
+            return registry.restore_account(account_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="unknown account") from None
 
     @router.post("/api/usage/refresh/{account_id}")
     async def refresh_usage(account_id: str, request: Request) -> UsageSnapshot:

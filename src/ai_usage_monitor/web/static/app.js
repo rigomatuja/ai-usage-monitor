@@ -4,7 +4,9 @@
  *   GET    /api/usage                     -> [{account_id, fetched_at, status, error, windows}]
  *   POST   /api/accounts                  {provider, label?, credentials} -> AccountInfo
  *   PATCH  /api/accounts/{id}             {label: string | null} -> AccountInfo
- *   DELETE /api/accounts/{id}             -> 204 (409 for auto accounts)
+ *   DELETE /api/accounts/{id}            -> 204 (auto accounts are hidden)
+ *   GET    /api/accounts/hidden          -> [AccountInfo]
+ *   POST   /api/accounts/{id}/restore    -> AccountInfo
  *   POST   /api/usage/refresh/{id}        -> UsageSnapshot
  * Credentials are sent to the server only; they are never rendered back.
  */
@@ -13,6 +15,7 @@
 const POLL_INTERVAL_MS = 60 * 1000; // server caches and polls providers at >= 300 s
 
 let accounts = [];
+let hiddenAccounts = [];
 let pendingOauth = null;
 let connectionLost = false;
 
@@ -20,13 +23,18 @@ const $ = (id) => document.getElementById(id);
 
 const els = {
   banner: $("connection-banner"),
-  cards: $("cards"),
+  groups: {
+    claude: { cards: $("cards-claude"), count: $("count-claude"), name: "Claude" },
+    openai: { cards: $("cards-openai"), count: $("count-openai"), name: "OpenAI" },
+  },
   refreshBtn: $("refresh-btn"),
   form: $("add-account-form"),
   provider: $("provider"),
   label: $("account-label"),
   credentials: $("credentials"),
   formError: $("add-account-error"),
+  hiddenAccounts: $("hidden-accounts"),
+  hiddenList: $("hidden-list"),
   signinClaude: $("signin-claude"),
   signinChatgpt: $("signin-chatgpt"),
   oauthWaiting: $("oauth-waiting"),
@@ -176,14 +184,14 @@ function renderCard(account, snapshot) {
   card.dataset.accountId = account.id;
 
   const head = el("div", "card-head");
-  head.append(el("h3", null, account.label));
-  head.append(el("span", `badge platform-${account.platform}`, account.platform));
+  const title = el("h3", null, account.label);
+  title.title = account.label;
+  head.append(title);
   head.append(el("span", "source-badge", account.source));
-  head.append(el("span", "provider-kind", account.provider));
   card.append(head);
-  if (account.custom_label) {
-    card.append(el("div", "card-default-label", `${account.provider} · ${account.default_label}`));
-  }
+  card.append(el("div", "card-default-label", account.custom_label
+    ? `${account.provider} · ${account.default_label}`
+    : account.provider));
 
   const usage = el("div", "card-usage");
   renderCardUsage(usage, snapshot);
@@ -192,14 +200,11 @@ function renderCard(account, snapshot) {
   const footer = el("div", "card-footer");
   const renameBtn = el("button", "rename-btn", "Rename");
   renameBtn.type = "button";
-  renameBtn.addEventListener("click", () => openRenameEditor(account, footer, renameBtn));
-  footer.append(renameBtn);
-  if (account.source === "manual") {
-    const removeBtn = el("button", "remove-btn", "Remove");
-    removeBtn.type = "button";
-    removeBtn.addEventListener("click", () => removeAccount(account.id, card));
-    footer.append(removeBtn);
-  }
+  const removeBtn = el("button", "remove-btn", "Remove");
+  removeBtn.type = "button";
+  renameBtn.addEventListener("click", () => openRenameEditor(account, footer, renameBtn, removeBtn));
+  removeBtn.addEventListener("click", () => openRemoveConfirmation(account, card, footer, renameBtn, removeBtn));
+  footer.append(renameBtn, removeBtn);
   card.append(footer);
 
   return card;
@@ -214,7 +219,7 @@ function renderCardUsage(usage, snapshot) {
     status.classList.add("ok");
     status.textContent = "ok";
   } else {
-    status.classList.add("ok");
+    status.classList.add("pending");
     status.textContent = "no usage data yet";
   }
   if (snapshot?.fetched_at) {
@@ -236,16 +241,51 @@ function snapshotsByAccount() {
   return new Map(lastUsage.map((snap) => [snap.account_id, snap]));
 }
 
+// Claude/Anthropic accounts in one group, ChatGPT/OpenAI in the other.
+function groupFor(account) {
+  return account.platform === "claude" ? els.groups.claude : els.groups.openai;
+}
+
 function renderAll() {
-  els.cards.textContent = "";
-  if (!accounts.length) {
-    els.cards.append(el("div", "empty-state", "No accounts configured yet. Add one below."));
-    return;
-  }
   const snapshots = snapshotsByAccount();
+  for (const group of Object.values(els.groups)) group.cards.textContent = "";
   for (const account of accounts) {
-    els.cards.append(renderCard(account, snapshots.get(account.id) || null));
+    groupFor(account).cards.append(renderCard(account, snapshots.get(account.id) || null));
   }
+  for (const group of Object.values(els.groups)) {
+    const count = group.cards.children.length;
+    group.count.textContent = String(count);
+    if (!count) {
+      group.cards.append(el("div", "empty-state", `No ${group.name} accounts yet. Connect one below.`));
+    }
+  }
+  renderHiddenAccounts();
+}
+
+function renderHiddenAccounts() {
+  els.hiddenList.replaceChildren();
+  for (const account of hiddenAccounts) {
+    const item = el("li");
+    const row = el("div", "hidden-row");
+    const login = el("div", "hidden-login");
+    login.append(el("div", null, account.label), el("div", "hidden-provider", account.provider));
+    const restoreBtn = el("button", "rename-btn", "Restore");
+    restoreBtn.type = "button";
+    restoreBtn.addEventListener("click", async () => {
+      restoreBtn.disabled = true;
+      try {
+        await restoreAccount(account.id);
+      } catch (err) {
+        showCardError(item, connectionLost ? "connection lost" : err.message);
+      } finally {
+        restoreBtn.disabled = false;
+      }
+    });
+    row.append(login, restoreBtn);
+    item.append(row);
+    els.hiddenList.append(item);
+  }
+  els.hiddenAccounts.classList.toggle("hidden", hiddenAccounts.length === 0);
 }
 
 /* --- data loading ----------------------------------------------------------- */
@@ -254,6 +294,7 @@ let lastUsage = [];
 
 async function loadAccounts() {
   accounts = await getJson("/api/accounts");
+  hiddenAccounts = await getJson("/api/accounts/hidden").catch(() => []);
   const attempt = pendingOauth;
   if (!attempt?.id) return;
   const res = await fetchJson(`/api/oauth/attempts/${encodeURIComponent(attempt.id)}`, { cache: "no-store" }).catch(() => null);
@@ -293,7 +334,7 @@ async function onRefreshClick() {
   }
 }
 
-function openRenameEditor(account, footer, renameBtn) {
+function openRenameEditor(account, footer, renameBtn, removeBtn) {
   const editor = el("div", "rename-editor");
   const input = el("input");
   input.type = "text";
@@ -305,6 +346,7 @@ function openRenameEditor(account, footer, renameBtn) {
   const close = () => {
     if (saving) return;
     editor.remove();
+    removeBtn.disabled = false;
     renameBtn.hidden = false;
     renameBtn.focus();
   };
@@ -355,30 +397,66 @@ function openRenameEditor(account, footer, renameBtn) {
     }
   });
 
+  removeBtn.disabled = true;
   renameBtn.hidden = true;
   footer.append(editor);
   input.focus();
 }
 
+function openRemoveConfirmation(account, card, footer, renameBtn, removeBtn) {
+  const confirmation = el("div", "remove-confirmation");
+  const prompt = account.source === "auto"
+    ? "Hide this local login? You can restore it below."
+    : "Remove this account?";
+  const confirm = el("button", "remove-btn remove-confirm-btn", "Confirm");
+  const cancel = el("button", "rename-btn", "Cancel");
+  confirm.type = cancel.type = "button";
+  const close = () => {
+    if (confirm.disabled) return;
+    confirmation.remove();
+    renameBtn.hidden = removeBtn.hidden = false;
+    removeBtn.focus();
+  };
+  cancel.addEventListener("click", close);
+  confirmation.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !event.isComposing) {
+      event.preventDefault();
+      close();
+    }
+  });
+  confirm.addEventListener("click", async () => {
+    confirm.disabled = cancel.disabled = true;
+    try {
+      await removeAccount(account.id, card);
+    } finally {
+      confirm.disabled = cancel.disabled = false;
+      if (confirmation.isConnected) cancel.focus();
+    }
+  });
+  renameBtn.hidden = removeBtn.hidden = true;
+  confirmation.append(el("span", "remove-prompt", prompt), confirm, cancel);
+  footer.append(confirmation);
+  cancel.focus();
+}
+
 async function removeAccount(id, card) {
-  let res;
   try {
-    res = await fetchJson(`/api/accounts/${encodeURIComponent(id)}`, { method: "DELETE" });
+    const res = await fetchJson(`/api/accounts/${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (res.status === 204) {
+      await refreshAll();
+    } else {
+      showCardError(card, serverErrorMessage(res, await res.json().catch(() => null)));
+    }
   } catch (err) {
-    showCardError(card, "connection lost");
-    return;
+    showCardError(card, connectionLost ? "connection lost" : err.message);
   }
-  if (res.status === 204) {
-    await refreshAll();
-    return;
-  }
-  let body = null;
-  try {
-    body = await res.json();
-  } catch {
-    /* ignore */
-  }
-  showCardError(card, serverErrorMessage(res, body)); // e.g. 409 for auto accounts
+}
+
+async function restoreAccount(id) {
+  const encodedId = encodeURIComponent(id);
+  await postJson(`/api/accounts/${encodedId}/restore`);
+  await postJson(`/api/usage/refresh/${encodedId}`).catch(() => {});
+  await refreshAll();
 }
 
 function showCardError(card, message) {
@@ -501,13 +579,11 @@ refreshAll().catch((err) => console.error("initial load failed:", err));
 setInterval(() => {
   loadUsage()
     .then(() => {
-      if (!els.cards.children.length) {
-        renderAll();
-        return;
-      }
-      // Refresh usage without replacing the card controls or an open editor.
+      const cards = Object.values(els.groups).flatMap((group) => [...group.cards.children]
+        .filter((node) => node.dataset?.accountId));
+      // Refresh usage without replacing card controls or hidden login rows.
       const snapshots = snapshotsByAccount();
-      for (const card of els.cards.children) {
+      for (const card of cards) {
         const usage = card.querySelector(".card-usage");
         if (usage) renderCardUsage(usage, snapshots.get(card.dataset.accountId) || null);
       }

@@ -20,9 +20,14 @@ def test_oauth_waiting_status(scenario):
 
 
 @pytest.mark.parametrize("scenario", [
-    "rename", "clear", "reset-default", "rename-error", "add-blank", "add-named", "remove",
+    "rename", "clear", "reset-default", "rename-error", "add-blank", "add-named",
 ])
 def test_account_names(scenario):
+    run_harness(scenario)
+
+
+@pytest.mark.parametrize("scenario", ["remove", "remove-cancel", "hide-auto", "restore", "restore-error"])
+def test_account_removal(scenario):
     run_harness(scenario)
 
 

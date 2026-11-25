@@ -18,8 +18,8 @@ token/cost usage, across multiple accounts per platform.
   credentials path, or several org keys).
 - **Local web dashboard**: one card per account with colored progress bars,
   reset times (weekday, date and time in your browser's time zone, plus a
-  countdown), stale-data markers, and add/remove account forms. Any account,
-  including auto-detected ones, can be renamed from its card (**Rename**);
+  countdown), stale-data markers, and controls to add or remove accounts.
+  Any account, including auto-detected ones, can be renamed from its card (**Rename**);
   clearing the name restores the default. No internet
   dependencies; the UI is fully offline.
 
@@ -87,9 +87,24 @@ Accounts are added in the dashboard's **Add account** form:
 
 Manual accounts are stored in the user config dir
 (`~/.config/ai-usage-monitor/accounts.json` on Linux) with `0600`
-permissions. Auto-detected accounts cannot be removed from the dashboard —
-they disappear when the login file is gone. Tokens are never refreshed or
-written back: the owning CLI manages its own credentials.
+permissions.
+
+### Removing and restoring accounts
+
+Select **Remove** on any account card, then **Confirm** on that card.
+Manually added and OAuth accounts are deleted from the monitor. Removing an
+[auto-detected login](#features-v1) hides it and stops usage polling. The hidden
+preference is stored in `hidden.json` in the same config directory. The CLI login
+files are untouched: the owning CLI still manages its credentials.
+
+To resume monitoring, select **Restore** next to the login under
+**Connect an account → Hidden local logins**. Only logins the app can still
+find locally are listed.
+
+The dashboard uses `DELETE /api/accounts/{account_id}` to remove or hide an
+account, `GET /api/accounts/hidden` to list hidden local logins, and
+`POST /api/accounts/{account_id}/restore` to restore one. Restore requests
+must originate from the dashboard.
 
 ## Development
 
