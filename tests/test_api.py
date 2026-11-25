@@ -375,9 +375,46 @@ class TestAccountsEndpoints:
         assert json.loads((config / "accounts.json").read_bytes()) == []
         assert json.loads((config / "labels.json").read_bytes()) == {}
 
-    def test_delete_auto_account_returns_409(self, client):
+    def test_delete_auto_account_hides_it_and_restore_brings_it_back(self, client):
+        client.post("/api/usage/refresh/auto-chatgpt-personal")
         response = client.delete("/api/accounts/auto-chatgpt-personal")
-        assert response.status_code == 409
+        assert (response.status_code, response.content) == (204, b"")
+        assert client.get("/api/accounts").json() == []
+        assert client.get("/api/usage").json() == []
+        assert client.post("/api/usage/refresh/auto-chatgpt-personal").status_code == 404
+        hidden = client.get("/api/accounts/hidden").json()
+        assert [(a["id"], a["source"]) for a in hidden] == [("auto-chatgpt-personal", "auto")]
+
+        restored = client.post(
+            "/api/accounts/auto-chatgpt-personal/restore", headers=DASHBOARD_HEADERS
+        )
+        assert restored.status_code == 200
+        assert restored.json()["id"] == "auto-chatgpt-personal"
+        assert [a["id"] for a in client.get("/api/accounts").json()] == ["auto-chatgpt-personal"]
+        assert client.get("/api/accounts/hidden").json() == []
+
+    @pytest.mark.parametrize("headers", [
+        {}, {"Origin": "http://evil.example"},
+        {"Origin": "http://127.0.0.1:61524", "Sec-Fetch-Site": "cross-site"},
+    ])
+    def test_restore_requires_dashboard_origin(self, client, headers):
+        client.delete("/api/accounts/auto-chatgpt-personal")
+        response = client.post("/api/accounts/auto-chatgpt-personal/restore", headers=headers)
+        assert response.status_code == 403
+        assert response.json() == {"detail": "Cross-origin account restore denied"}
+        assert [a["id"] for a in client.get("/api/accounts/hidden").json()] == [
+            "auto-chatgpt-personal"
+        ]
+
+    @pytest.mark.parametrize("account_id", ["auto-chatgpt-personal", "auto-claude-personal", "nope"])
+    def test_restore_of_account_not_hidden_returns_404(self, client, account_id):
+        response = client.post(f"/api/accounts/{account_id}/restore", headers=DASHBOARD_HEADERS)
+        assert response.status_code == 404
+        assert response.json() == {"detail": "unknown account"}
+
+    def test_delete_undetected_auto_account_returns_404(self, client):
+        response = client.delete("/api/accounts/auto-claude-personal")
+        assert response.status_code == 404
 
     def test_delete_unknown_account_returns_404(self, client):
         response = client.delete("/api/accounts/nope")

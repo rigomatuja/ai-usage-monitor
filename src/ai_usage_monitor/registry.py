@@ -3,7 +3,7 @@
 Auto accounts are derived from the presence of local CLI login files; manual
 accounts are persisted as JSON under the user config directory with 0600
 permissions (they may contain credentials). Custom labels for either kind of
-account are stored separately with the same permissions.
+account and hidden local login IDs are stored separately with the same permissions.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ AUTO_CHATGPT_ID = "auto-chatgpt-personal"
 
 
 class AccountError(Exception):
-    """A manual account operation failed (e.g. removing an auto account)."""
+    """An account operation failed."""
 
 
 class InvalidAccountLabel(ValueError):
@@ -68,6 +68,7 @@ class AccountRegistry:
         self._config_dir = config_dir or Path(user_config_dir("ai-usage-monitor"))
         self._accounts_file = self._config_dir / "accounts.json"
         self._labels_file = self._config_dir / "labels.json"
+        self._hidden_file = self._config_dir / "hidden.json"
         self._claude_path = claude_credentials_path or (
             Path.home() / CLAUDE_CREDENTIALS_FILENAME
         )
@@ -99,6 +100,32 @@ class AccountRegistry:
 
     def is_auto(self, account_id: str) -> bool:
         return account_id in (AUTO_CLAUDE_ID, AUTO_CHATGPT_ID)
+
+    def _read_hidden(self) -> set[str]:
+        try:
+            raw = json.loads(self._hidden_file.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return set()
+        if not isinstance(raw, list):
+            raise ValueError("expected a hidden account list")
+        return {item for item in raw if isinstance(item, str) and self.is_auto(item)}
+
+    def _load_hidden(self) -> set[str]:
+        try:
+            return self._read_hidden()
+        except (ValueError, OSError):
+            return set()
+
+    def _load_hidden_for_write(self) -> set[str]:
+        """An unparseable store is empty; other read errors abort the update."""
+        try:
+            return self._read_hidden()
+        except ValueError:
+            return set()
+
+    def _visible_auto_configs(self) -> list[AccountConfig]:
+        hidden = self._load_hidden()
+        return [account for account in self._auto_configs() if account.id not in hidden]
 
     # -- manual accounts ----------------------------------------------------
 
@@ -170,7 +197,7 @@ class AccountRegistry:
         except Exception as exc:
             logger.warning("Could not clean up account labels (%s)", type(exc).__name__)
 
-    def _save_json(self, path: Path, data: list[dict] | dict[str, str]) -> None:
+    def _save_json(self, path: Path, data: list[dict] | dict[str, str] | list[str]) -> None:
         payload = json.dumps(data, indent=2) + "\n"
         self._config_dir.mkdir(parents=True, exist_ok=True)
         # Write privately beside the target so an interrupted write cannot
@@ -236,7 +263,10 @@ class AccountRegistry:
 
     def set_label(self, account_id: str, label: str | None) -> AccountInfo:
         """Set or clear a display name without changing the account config."""
-        accounts = self.iter_configs()
+        if self.is_auto(account_id) and account_id in self._load_hidden():
+            raise KeyError(account_id)
+        # Keep the labels of detected but hidden logins when pruning.
+        accounts = self._auto_configs() + self._load_manual()
         account = next((item for item in accounts if item.id == account_id), None)
         if account is None:
             raise KeyError(account_id)
@@ -252,13 +282,19 @@ class AccountRegistry:
         return self._account_info(account, labels)
 
     def remove_account(self, account_id: str) -> None:
-        """Remove a manual account. Raises AccountError for auto accounts,
-        KeyError for unknown ids."""
+        """Delete a manual account or hide a detected login without touching its file.
+
+        Raises KeyError if the account is unknown or already hidden.
+        """
         if self.is_auto(account_id):
-            raise AccountError(
-                f"Account {account_id} is auto-detected from a local login; "
-                "it cannot be removed from the registry."
-            )
+            if not any(account.id == account_id for account in self._auto_configs()):
+                raise KeyError(account_id)
+            hidden = self._load_hidden_for_write()
+            if account_id in hidden:
+                raise KeyError(account_id)
+            hidden.add(account_id)
+            self._save_json(self._hidden_file, sorted(hidden))
+            return
         accounts = self._load_manual()
         remaining = [a for a in accounts if a.id != account_id]
         if len(remaining) == len(accounts):
@@ -267,6 +303,16 @@ class AccountRegistry:
         # ignore the orphan and the next labels write can prune it.
         self._save_manual(remaining)
         self._clean_labels_best_effort(remaining)
+
+    def restore_account(self, account_id: str) -> AccountInfo:
+        """Restore a hidden local login; raise KeyError if not hidden or detected."""
+        account = next((item for item in self._auto_configs() if item.id == account_id), None)
+        if account is None:
+            raise KeyError(account_id)
+        hidden = self._load_hidden_for_write()
+        hidden.remove(account_id)
+        self._save_json(self._hidden_file, sorted(hidden))
+        return self._account_info(account, self._load_labels())
 
     def update_credentials(self, account_id: str, credentials: dict[str, str]) -> None:
         """Replace the stored credentials of a manual account and persist
@@ -288,8 +334,8 @@ class AccountRegistry:
         raise KeyError(account_id)
 
     def iter_configs(self) -> list[AccountConfig]:
-        """All current accounts: auto-detected first, then manual."""
-        return self._auto_configs() + self._load_manual()
+        """Visible accounts: auto-detected first, then manual."""
+        return self._visible_auto_configs() + self._load_manual()
 
     def get_config(self, account_id: str) -> AccountConfig | None:
         for account in self.iter_configs():
@@ -306,6 +352,16 @@ class AccountRegistry:
     def list_infos(self) -> list[AccountInfo]:
         labels = self._load_labels()
         return [self._account_info(account, labels) for account in self.iter_configs()]
+
+    def list_hidden_infos(self) -> list[AccountInfo]:
+        """Hidden login accounts whose CLI login files are still detected."""
+        hidden = self._load_hidden()
+        labels = self._load_labels()
+        return [
+            self._account_info(account, labels)
+            for account in self._auto_configs()
+            if account.id in hidden
+        ]
 
     def _account_info(self, account: AccountConfig, labels: dict[str, str]) -> AccountInfo:
         return AccountInfo(

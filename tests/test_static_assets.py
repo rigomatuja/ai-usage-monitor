@@ -60,6 +60,8 @@ def test_static_assets_exist():
         "account-label",  # label text input
         "credentials",  # credentials textarea
         "add-account-error",  # inline server error area for the form
+        "hidden-accounts",  # restorable local logins panel
+        "hidden-list",  # entries for hidden, still-detected logins
         "connection-banner",  # non-blocking "connection lost" banner
     ],
 )

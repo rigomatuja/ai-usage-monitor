@@ -67,10 +67,65 @@ class TestAutoDetection:
             AUTO_CHATGPT_ID,
         ]
 
-    def test_auto_account_cannot_be_removed(self, tmp_path):
+    def test_removing_auto_account_hides_it_without_touching_cli_file(self, tmp_path):
+        registry = make_registry(tmp_path, claude=True, codex=True)
+        cli_file = tmp_path / "home" / ".claude" / ".credentials.json"
+        before = cli_file.read_bytes()
+        registry.remove_account(AUTO_CLAUDE_ID)
+        assert cli_file.read_bytes() == before
+        assert [i.id for i in registry.list_infos()] == [AUTO_CHATGPT_ID]
+        assert registry.get_config(AUTO_CLAUDE_ID) is None
+        assert [i.id for i in registry.list_hidden_infos()] == [AUTO_CLAUDE_ID]
+        hidden_file = tmp_path / "config" / "hidden.json"
+        assert json.loads(hidden_file.read_text()) == [AUTO_CLAUDE_ID]
+        assert hidden_file.stat().st_mode & 0o777 == 0o600
+
+    def test_restore_brings_back_hidden_auto_account_with_its_name(self, tmp_path):
         registry = make_registry(tmp_path, claude=True)
-        with pytest.raises(AccountError):
-            registry.remove_account(AUTO_CLAUDE_ID)
+        registry.set_label(AUTO_CLAUDE_ID, "Personal")
+        registry.remove_account(AUTO_CLAUDE_ID)
+        assert registry.list_infos() == []
+        info = registry.restore_account(AUTO_CLAUDE_ID)
+        assert (info.id, info.label, info.source) == (AUTO_CLAUDE_ID, "Personal", "auto")
+        assert [i.id for i in registry.list_infos()] == [AUTO_CLAUDE_ID]
+        assert registry.list_hidden_infos() == []
+
+    def test_restore_rejects_accounts_that_are_not_hidden(self, tmp_path):
+        registry = make_registry(tmp_path, claude=True)
+        for account_id in (AUTO_CLAUDE_ID, AUTO_CHATGPT_ID, "nope"):
+            with pytest.raises(KeyError):
+                registry.restore_account(account_id)
+
+    def test_hiding_an_undetected_auto_account_is_unknown(self, tmp_path):
+        registry = make_registry(tmp_path, claude=True)
+        with pytest.raises(KeyError):
+            registry.remove_account(AUTO_CHATGPT_ID)
+        assert not (tmp_path / "config" / "hidden.json").exists()
+
+    def test_hidden_login_whose_file_is_gone_is_not_listed(self, tmp_path):
+        registry = make_registry(tmp_path, claude=True)
+        registry.remove_account(AUTO_CLAUDE_ID)
+        (tmp_path / "home" / ".claude" / ".credentials.json").unlink()
+        assert registry.list_hidden_infos() == []
+        with pytest.raises(KeyError):
+            registry.restore_account(AUTO_CLAUDE_ID)
+
+    def test_unreadable_hidden_store_aborts_hide_and_restore(self, tmp_path):
+        registry = make_registry(tmp_path, claude=True, codex=True)
+        registry.remove_account(AUTO_CLAUDE_ID)
+        hidden_file = tmp_path / "config" / "hidden.json"
+        before = hidden_file.read_bytes()
+        hidden_file.chmod(0)
+        try:
+            if os.access(hidden_file, os.R_OK):
+                pytest.skip("running with privileges that bypass file modes")
+            with pytest.raises(OSError):
+                registry.remove_account(AUTO_CHATGPT_ID)
+            with pytest.raises(OSError):
+                registry.restore_account(AUTO_CLAUDE_ID)
+        finally:
+            hidden_file.chmod(0o600)
+        assert hidden_file.read_bytes() == before
 
 
 class TestManualAccounts:

@@ -59,7 +59,7 @@ class Element {
   }
 
   setAttribute() {}
-  focus() {}
+  focus() { focused = this; }
   reset() {}
 
   replaceChildren(...children) {
@@ -81,6 +81,9 @@ class Element {
     return this.dispatch("click");
   }
 }
+
+let focused;
+let hiddenAccounts = [];
 
 function account(id, provider = "claude_personal", source = "manual") {
   return { id, provider, source, label: id, platform: "claude", default_label: id, custom_label: false };
@@ -110,6 +113,21 @@ async function exerciseAccounts(scenario, elements, requests, initial, poll) {
   assert.equal(elements.get("count-openai").textContent, "0");
   assert.match(elements.get("cards-openai").textContent, /^No OpenAI accounts yet/);
   const [auto, manual] = initial;
+  const hiddenPanel = elements.get("hidden-accounts");
+  const hiddenList = elements.get("hidden-list");
+  const openConfirmation = async (card, text) => {
+    const remove = button(card, "Remove");
+    assert.ok(remove, "Remove control exists");
+    const renameControl = button(card, "Rename");
+    await remove.click();
+    assert.deepEqual(requests, [], "opening confirmation does not send a request");
+    assert.equal(remove.hidden, true);
+    assert.equal(renameControl.hidden, true);
+    assert.match(card.textContent, text);
+    assert.ok(button(card, "Confirm"));
+    assert.ok(button(card, "Cancel"));
+    return { remove, renameControl };
+  };
   const heading = (card) => card.querySelector("h3").textContent;
   const rename = (card) => {
     const control = button(card, "Rename");
@@ -197,13 +215,79 @@ async function exerciseAccounts(scenario, elements, requests, initial, poll) {
       assert.equal(heading(cards.children[2]), added.label);
       break;
     }
-    case "remove":
-      assert.equal(button(autoCard, "Remove"), null);
+    case "remove": {
+      await openConfirmation(manualCard, /Remove this account\?/);
       requests.push(["DELETE", `/api/accounts/${manual.id}`, null, undefined, { status: 204 }],
         ["GET", "/api/accounts", [auto]], ["GET", "/api/usage", []]);
-      await button(manualCard, "Remove").click();
+      await button(manualCard, "Confirm").click();
       assert.deepEqual(cards.children.map(heading), [auto.label]);
+      assert.equal(hiddenPanel.classList.contains("hidden"), true);
       break;
+    }
+    case "remove-cancel": {
+      for (const escape of [false, true]) {
+        const { remove, renameControl } = await openConfirmation(manualCard, /Remove this account\?/);
+        const cancel = button(manualCard, "Cancel");
+        requests.push(["GET", "/api/usage", [{ ...snapshot, account_id: manual.id }]]);
+        poll();
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.match(manualCard.querySelector(".card-status").textContent, /updated 5 min ago/);
+        assert.equal(button(manualCard, "Cancel"), cancel, "usage polling preserves confirmation");
+        if (escape) await cancel.dispatch("keydown", { key: "Escape" });
+        else await cancel.click();
+        assert.equal(button(manualCard, "Confirm"), null);
+        assert.equal(button(manualCard, "Cancel"), null);
+        assert.equal(remove.hidden, false);
+        assert.equal(renameControl.hidden, false);
+        assert.equal(focused, remove);
+        assert.deepEqual(cards.children.map(heading), [auto.label, manual.label]);
+        assert.deepEqual(requests, []);
+      }
+      break;
+    }
+    case "hide-auto": {
+      await openConfirmation(autoCard, /Hide this local login\? You can restore it below\./);
+      hiddenAccounts = [auto];
+      requests.push(["DELETE", `/api/accounts/${auto.id}`, null, undefined, { status: 204 }],
+        ["GET", "/api/accounts", [manual]], ["GET", "/api/usage", []]);
+      await button(autoCard, "Confirm").click();
+      assert.deepEqual(cards.children.map(heading), [manual.label]);
+      assert.equal(hiddenPanel.classList.contains("hidden"), false);
+      const [item] = hiddenList.children;
+      assert.equal(item.tagName, "li");
+      assert.ok(item.textContent.includes(auto.label));
+      assert.ok(item.textContent.includes(auto.provider));
+      assert.ok(button(item, "Restore"));
+      break;
+    }
+    case "restore":
+    case "restore-error": {
+      const [login] = hiddenAccounts;
+      assert.equal(hiddenPanel.classList.contains("hidden"), false);
+      assert.deepEqual(cards.children.map(heading), [auto.label]);
+      assert.match(elements.get("cards-openai").textContent, /^No OpenAI accounts yet/);
+      const [item] = hiddenList.children;
+      if (scenario === "restore-error") {
+        requests.push(["POST", `/api/accounts/${login.id}/restore`, { detail: "unknown account" }, undefined, { status: 404 }]);
+        await button(item, "Restore").click();
+        assert.equal(item.querySelector(".card-inline-error").textContent, "unknown account");
+        requests.push(["POST", `/api/accounts/${login.id}/restore`, null, undefined, { offline: true }]);
+        await button(item, "Restore").click();
+        assert.equal(item.querySelector(".card-inline-error").textContent, "connection lost");
+        assert.deepEqual(hiddenList.children, [item]);
+        break;
+      }
+      hiddenAccounts = [];
+      requests.push(["POST", `/api/accounts/${login.id}/restore`, login],
+        ["POST", `/api/usage/refresh/${login.id}`, null, undefined, { status: 500 }],
+        ["GET", "/api/accounts", [login, auto]], ["GET", "/api/usage", []]);
+      await button(item, "Restore").click();
+      assert.deepEqual(elements.get("cards-openai").children.map(heading), [login.label]);
+      assert.equal(elements.get("count-openai").textContent, "1");
+      assert.equal(hiddenPanel.classList.contains("hidden"), true);
+      assert.deepEqual(hiddenList.children, []);
+      break;
+    }
     default:
       throw new Error(`Unknown account scenario: ${scenario}`);
   }
@@ -238,16 +322,23 @@ async function main() {
     "connection-banner", "cards", "cards-claude", "cards-openai", "count-claude",
     "count-openai", "refresh-btn", "add-account-form", "provider",
     "account-label", "credentials", "add-account-error", "signin-claude",
-    "signin-chatgpt", "oauth-waiting", "oauth-error",
+    "signin-chatgpt", "oauth-waiting", "oauth-error", "hidden-accounts", "hidden-list",
   ];
-  const elements = new Map(ids.map((id) => [id, new Element("div", id.startsWith("oauth-"))]));
+  const elements = new Map(ids.map((id) => [id,
+    new Element("div", id.startsWith("oauth-") || id === "hidden-accounts")]));
   const waiting = elements.get("oauth-waiting");
   const authorizeUrl = "https://example.invalid/authorize?state=claude";
   const old = account("old");
   const other = account("other", "chatgpt_personal");
   const dates = ["dates", "no-reset", "error-date"].includes(scenario);
-  const accounts = ["rename", "clear", "reset-default", "rename-error", "add-blank", "add-named", "remove"].includes(scenario);
-  const initial = accounts ? [
+  const restoring = ["restore", "restore-error"].includes(scenario);
+  const accounts = ["rename", "clear", "reset-default", "rename-error", "add-blank", "add-named",
+    "remove", "remove-cancel", "hide-auto"].includes(scenario) || restoring;
+  if (restoring) {
+    hiddenAccounts = [{ ...account("auto-chatgpt-personal", "chatgpt_personal", "auto"),
+      label: "Local ChatGPT", platform: "openai" }];
+  }
+  const initial = restoring ? [old] : accounts ? [
     { ...old, source: "auto", label: "Claude (local login)", default_label: "Claude (local login)" },
     { ...other, label: "Personal ChatGPT", default_label: "ChatGPT", custom_label: true },
   ] : [old, other];
@@ -260,6 +351,7 @@ async function main() {
     : dates ? [snapshot] : [];
   const requests = [["GET", "/api/accounts", initial], ["GET", "/api/usage", usage]];
   let poll;
+  const unexpected = [];
   const context = vm.createContext({
     Date: class extends Date { static now() { return Date.parse(now); } },
     document: {
@@ -275,6 +367,9 @@ async function main() {
       },
     },
     async fetch(url, options) {
+      if (url === "/api/accounts/hidden" && (options?.method ?? "GET") === "GET") {
+        return { ok: true, json: async () => hiddenAccounts };
+      }
       if (url === `/api/oauth/attempts/attempt-${opens}`) {
         const messages = {
           failed: "Sign-in failed. Please try signing in again.",
@@ -287,6 +382,7 @@ async function main() {
         };
       }
       const request = requests.shift();
+      if (!request) unexpected.push(url);
       assert.ok(request, `Unexpected request: ${url}`);
       const [method, path, body, opened, response = {}] = request;
       assert.equal(options?.method ?? "GET", method);
@@ -296,6 +392,7 @@ async function main() {
         assert.equal(options.headers["Content-Type"], "application/json");
         assert.deepEqual(JSON.parse(options.body), response.payload);
       }
+      if (response.offline) throw new TypeError("Fetch failed");
       const status = response.status ?? 200;
       return { ok: status < 400, status, json: async () => body };
     },
@@ -329,6 +426,7 @@ async function main() {
     if (accounts) await exerciseAccounts(scenario, elements, requests, initial, poll);
     else exerciseDates(scenario, elements.get("cards-claude").children[0]);
     assert.deepEqual(requests, []);
+    assert.deepEqual(unexpected, []);
     process.stdout.write(JSON.stringify({ scenario, passed: true }));
     return;
   }
@@ -407,6 +505,7 @@ async function main() {
       throw new Error(`Unknown scenario: ${scenario}`);
   }
   assert.deepEqual(requests, []);
+  assert.deepEqual(unexpected, []);
   process.stdout.write(JSON.stringify({ scenario, passed: true }));
 }
 
