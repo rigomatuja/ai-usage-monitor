@@ -19,8 +19,12 @@
   </header>
 
   <main>
+    <div id="no-accounts" class="empty-state" hidden>
+      No accounts connected yet. Connect one below.
+    </div>
+
     <div id="cards" class="platform-groups" aria-live="polite">
-      <section class="platform-group group-claude" aria-labelledby="group-claude-title">
+      <section id="group-claude" class="platform-group group-claude" hidden aria-labelledby="group-claude-title">
         <header class="group-head">
           <h2 id="group-claude-title">Claude</h2>
           <span id="count-claude" class="group-count">0</span>
@@ -29,7 +33,7 @@
           <!-- Claude / Anthropic account cards, rendered by app.js -->
         </div>
       </section>
-      <section class="platform-group group-openai" aria-labelledby="group-openai-title">
+      <section id="group-openai" class="platform-group group-openai" hidden aria-labelledby="group-openai-title">
         <header class="group-head">
           <h2 id="group-openai-title">OpenAI</h2>
           <span id="count-openai" class="group-count">0</span>

@@ -54,6 +54,9 @@ def test_static_assets_exist():
         "cards-openai",  # ChatGPT / OpenAI account cards
         "count-claude",  # account count in the Claude group header
         "count-openai",  # account count in the OpenAI group header
+        "group-claude",  # Claude column, hidden when it has no accounts
+        "group-openai",  # OpenAI column, hidden when it has no accounts
+        "no-accounts",  # shown only when no platform has an account
         "refresh-btn",  # global Refresh button
         "add-account-form",  # Add account form
         "provider",  # provider select (4 provider kinds)

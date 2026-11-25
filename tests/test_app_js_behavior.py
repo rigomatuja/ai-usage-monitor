@@ -26,7 +26,7 @@ def test_account_names(scenario):
     run_harness(scenario)
 
 
-@pytest.mark.parametrize("scenario", ["remove", "remove-cancel", "hide-auto", "restore", "restore-error"])
+@pytest.mark.parametrize("scenario", ["remove", "remove-cancel", "remove-all", "hide-auto", "restore", "restore-error"])
 def test_account_removal(scenario):
     run_harness(scenario)
 

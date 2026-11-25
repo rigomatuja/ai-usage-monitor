@@ -111,7 +111,11 @@ async function exerciseAccounts(scenario, elements, requests, initial, poll) {
   // Claude accounts are grouped apart from OpenAI ones, each group counted.
   assert.equal(elements.get("count-claude").textContent, String(cards.children.length));
   assert.equal(elements.get("count-openai").textContent, "0");
-  assert.match(elements.get("cards-openai").textContent, /^No OpenAI accounts yet/);
+  // A platform with no connected account hides its whole column.
+  const groupHidden = (platform) => elements.get(`group-${platform}`).hidden;
+  assert.equal(groupHidden("claude"), false);
+  assert.equal(groupHidden("openai"), true);
+  assert.equal(elements.get("no-accounts").hidden, true);
   const [auto, manual] = initial;
   const hiddenPanel = elements.get("hidden-accounts");
   const hiddenList = elements.get("hidden-list");
@@ -245,6 +249,18 @@ async function exerciseAccounts(scenario, elements, requests, initial, poll) {
       }
       break;
     }
+    case "remove-all": {
+      await openConfirmation(manualCard, /Remove this account\?/);
+      requests.push(["DELETE", `/api/accounts/${manual.id}`, null, undefined, { status: 204 }],
+        ["GET", "/api/accounts", []], ["GET", "/api/usage", []]);
+      await button(manualCard, "Confirm").click();
+      assert.equal(groupHidden("claude"), true);
+      assert.equal(groupHidden("openai"), true);
+      assert.equal(elements.get("no-accounts").hidden, false);
+      assert.equal(elements.get("count-claude").textContent, "0");
+      assert.deepEqual(cards.children, []);
+      break;
+    }
     case "hide-auto": {
       await openConfirmation(autoCard, /Hide this local login\? You can restore it below\./);
       hiddenAccounts = [auto];
@@ -265,7 +281,7 @@ async function exerciseAccounts(scenario, elements, requests, initial, poll) {
       const [login] = hiddenAccounts;
       assert.equal(hiddenPanel.classList.contains("hidden"), false);
       assert.deepEqual(cards.children.map(heading), [auto.label]);
-      assert.match(elements.get("cards-openai").textContent, /^No OpenAI accounts yet/);
+      assert.equal(groupHidden("openai"), true);
       const [item] = hiddenList.children;
       if (scenario === "restore-error") {
         requests.push(["POST", `/api/accounts/${login.id}/restore`, { detail: "unknown account" }, undefined, { status: 404 }]);
@@ -284,6 +300,7 @@ async function exerciseAccounts(scenario, elements, requests, initial, poll) {
       await button(item, "Restore").click();
       assert.deepEqual(elements.get("cards-openai").children.map(heading), [login.label]);
       assert.equal(elements.get("count-openai").textContent, "1");
+      assert.equal(groupHidden("openai"), false);
       assert.equal(hiddenPanel.classList.contains("hidden"), true);
       assert.deepEqual(hiddenList.children, []);
       break;
@@ -323,6 +340,7 @@ async function main() {
     "count-openai", "refresh-btn", "add-account-form", "provider",
     "account-label", "credentials", "add-account-error", "signin-claude",
     "signin-chatgpt", "oauth-waiting", "oauth-error", "hidden-accounts", "hidden-list",
+    "group-claude", "group-openai", "no-accounts",
   ];
   const elements = new Map(ids.map((id) => [id,
     new Element("div", id.startsWith("oauth-") || id === "hidden-accounts")]));
@@ -333,7 +351,7 @@ async function main() {
   const dates = ["dates", "no-reset", "error-date"].includes(scenario);
   const restoring = ["restore", "restore-error"].includes(scenario);
   const accounts = ["rename", "clear", "reset-default", "rename-error", "add-blank", "add-named",
-    "remove", "remove-cancel", "hide-auto"].includes(scenario) || restoring;
+    "remove", "remove-cancel", "remove-all", "hide-auto"].includes(scenario) || restoring;
   if (restoring) {
     hiddenAccounts = [{ ...account("auto-chatgpt-personal", "chatgpt_personal", "auto"),
       label: "Local ChatGPT", platform: "openai" }];
