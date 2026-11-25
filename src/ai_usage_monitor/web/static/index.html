@@ -19,32 +19,52 @@
   </header>
 
   <main>
-    <section id="cards" class="cards-grid" aria-live="polite">
-      <!-- one card per account, rendered by app.js -->
-    </section>
+    <div id="cards" class="platform-groups" aria-live="polite">
+      <section class="platform-group group-claude" aria-labelledby="group-claude-title">
+        <header class="group-head">
+          <h2 id="group-claude-title">Claude</h2>
+          <span id="count-claude" class="group-count">0</span>
+        </header>
+        <div id="cards-claude" class="group-cards">
+          <!-- Claude / Anthropic account cards, rendered by app.js -->
+        </div>
+      </section>
+      <section class="platform-group group-openai" aria-labelledby="group-openai-title">
+        <header class="group-head">
+          <h2 id="group-openai-title">OpenAI</h2>
+          <span id="count-openai" class="group-count">0</span>
+        </header>
+        <div id="cards-openai" class="group-cards">
+          <!-- ChatGPT / OpenAI account cards, rendered by app.js -->
+        </div>
+      </section>
+    </div>
 
-    <section class="signin">
-      <h2>Sign in</h2>
-      <div class="oauth-buttons">
-        <button id="signin-claude" type="button" title="Add an extra Claude personal account via OAuth">
-          Sign in with Claude
-        </button>
-        <button id="signin-chatgpt" type="button" title="Add an extra ChatGPT personal account via OAuth">
-          Sign in with ChatGPT
-        </button>
+    <section class="connect" aria-labelledby="connect-title">
+      <h2 id="connect-title">Connect an account</h2>
+      <div class="connect-grid">
+      <div class="connect-panel signin">
+        <h3>Sign in</h3>
+        <p class="help-text">
+          Opens the provider login in a new tab. The account appears automatically
+          once the login finishes — it can be removed like any other manual account.
+        </p>
+        <div class="oauth-buttons">
+          <button id="signin-claude" class="oauth-claude" type="button" title="Add an extra Claude personal account via OAuth">
+            Sign in with Claude
+          </button>
+          <button id="signin-chatgpt" class="oauth-openai" type="button" title="Add an extra ChatGPT personal account via OAuth">
+            Sign in with ChatGPT
+          </button>
+        </div>
+        <div id="oauth-waiting" class="oauth-waiting hidden" role="status">
+          Waiting for login to complete…
+        </div>
+        <div id="oauth-error" class="form-error hidden" role="alert"></div>
       </div>
-      <div id="oauth-waiting" class="oauth-waiting hidden" role="status">
-        Waiting for login to complete…
-      </div>
-      <div id="oauth-error" class="form-error hidden" role="alert"></div>
-      <small class="help-text">
-        Opens the provider login in a new tab. The account appears automatically
-        once the login finishes — it can be removed like any other manual account.
-      </small>
-    </section>
 
-    <section class="add-account">
-      <h2>Add account</h2>
+      <div class="connect-panel add-account">
+      <h3>Add manually</h3>
       <form id="add-account-form">
         <div class="form-row">
           <label for="provider">Provider</label>
@@ -74,6 +94,8 @@
         <div id="add-account-error" class="form-error hidden" role="alert"></div>
         <button type="submit">Add account</button>
       </form>
+      </div>
+      </div>
     </section>
   </main>
 

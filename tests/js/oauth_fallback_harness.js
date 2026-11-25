@@ -103,8 +103,12 @@ function button(node, text) {
 }
 
 async function exerciseAccounts(scenario, elements, requests, initial, poll) {
-  const cards = elements.get("cards");
+  const cards = elements.get("cards-claude");
   const [autoCard, manualCard] = cards.children;
+  // Claude accounts are grouped apart from OpenAI ones, each group counted.
+  assert.equal(elements.get("count-claude").textContent, String(cards.children.length));
+  assert.equal(elements.get("count-openai").textContent, "0");
+  assert.match(elements.get("cards-openai").textContent, /^No OpenAI accounts yet/);
   const [auto, manual] = initial;
   const heading = (card) => card.querySelector("h3").textContent;
   const rename = (card) => {
@@ -231,7 +235,8 @@ function exerciseDates(scenario, card) {
 async function main() {
   const [, , appPath, scenario] = process.argv;
   const ids = [
-    "connection-banner", "cards", "refresh-btn", "add-account-form", "provider",
+    "connection-banner", "cards", "cards-claude", "cards-openai", "count-claude",
+    "count-openai", "refresh-btn", "add-account-form", "provider",
     "account-label", "credentials", "add-account-error", "signin-claude",
     "signin-chatgpt", "oauth-waiting", "oauth-error",
   ];
@@ -322,7 +327,7 @@ async function main() {
 
   if (accounts || dates) {
     if (accounts) await exerciseAccounts(scenario, elements, requests, initial, poll);
-    else exerciseDates(scenario, elements.get("cards").children[0]);
+    else exerciseDates(scenario, elements.get("cards-claude").children[0]);
     assert.deepEqual(requests, []);
     process.stdout.write(JSON.stringify({ scenario, passed: true }));
     return;

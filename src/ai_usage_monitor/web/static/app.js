@@ -20,7 +20,10 @@ const $ = (id) => document.getElementById(id);
 
 const els = {
   banner: $("connection-banner"),
-  cards: $("cards"),
+  groups: {
+    claude: { cards: $("cards-claude"), count: $("count-claude"), name: "Claude" },
+    openai: { cards: $("cards-openai"), count: $("count-openai"), name: "OpenAI" },
+  },
   refreshBtn: $("refresh-btn"),
   form: $("add-account-form"),
   provider: $("provider"),
@@ -176,14 +179,14 @@ function renderCard(account, snapshot) {
   card.dataset.accountId = account.id;
 
   const head = el("div", "card-head");
-  head.append(el("h3", null, account.label));
-  head.append(el("span", `badge platform-${account.platform}`, account.platform));
+  const title = el("h3", null, account.label);
+  title.title = account.label;
+  head.append(title);
   head.append(el("span", "source-badge", account.source));
-  head.append(el("span", "provider-kind", account.provider));
   card.append(head);
-  if (account.custom_label) {
-    card.append(el("div", "card-default-label", `${account.provider} · ${account.default_label}`));
-  }
+  card.append(el("div", "card-default-label", account.custom_label
+    ? `${account.provider} · ${account.default_label}`
+    : account.provider));
 
   const usage = el("div", "card-usage");
   renderCardUsage(usage, snapshot);
@@ -214,7 +217,7 @@ function renderCardUsage(usage, snapshot) {
     status.classList.add("ok");
     status.textContent = "ok";
   } else {
-    status.classList.add("ok");
+    status.classList.add("pending");
     status.textContent = "no usage data yet";
   }
   if (snapshot?.fetched_at) {
@@ -236,15 +239,23 @@ function snapshotsByAccount() {
   return new Map(lastUsage.map((snap) => [snap.account_id, snap]));
 }
 
+// Claude/Anthropic accounts in one group, ChatGPT/OpenAI in the other.
+function groupFor(account) {
+  return account.platform === "claude" ? els.groups.claude : els.groups.openai;
+}
+
 function renderAll() {
-  els.cards.textContent = "";
-  if (!accounts.length) {
-    els.cards.append(el("div", "empty-state", "No accounts configured yet. Add one below."));
-    return;
-  }
   const snapshots = snapshotsByAccount();
+  for (const group of Object.values(els.groups)) group.cards.textContent = "";
   for (const account of accounts) {
-    els.cards.append(renderCard(account, snapshots.get(account.id) || null));
+    groupFor(account).cards.append(renderCard(account, snapshots.get(account.id) || null));
+  }
+  for (const group of Object.values(els.groups)) {
+    const count = group.cards.children.length;
+    group.count.textContent = String(count);
+    if (!count) {
+      group.cards.append(el("div", "empty-state", `No ${group.name} accounts yet. Connect one below.`));
+    }
   }
 }
 
@@ -501,13 +512,15 @@ refreshAll().catch((err) => console.error("initial load failed:", err));
 setInterval(() => {
   loadUsage()
     .then(() => {
-      if (!els.cards.children.length) {
+      const cards = Object.values(els.groups).flatMap((group) => [...group.cards.children]
+        .filter((node) => node.dataset?.accountId));
+      if (!cards.length) {
         renderAll();
         return;
       }
       // Refresh usage without replacing the card controls or an open editor.
       const snapshots = snapshotsByAccount();
-      for (const card of els.cards.children) {
+      for (const card of cards) {
         const usage = card.querySelector(".card-usage");
         if (usage) renderCardUsage(usage, snapshots.get(card.dataset.accountId) || null);
       }

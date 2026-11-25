@@ -49,7 +49,11 @@ def test_static_assets_exist():
 @pytest.mark.parametrize(
     "dom_id",
     [
-        "cards",  # per-account card container
+        "cards",  # container of the two platform groups
+        "cards-claude",  # Claude / Anthropic account cards
+        "cards-openai",  # ChatGPT / OpenAI account cards
+        "count-claude",  # account count in the Claude group header
+        "count-openai",  # account count in the OpenAI group header
         "refresh-btn",  # global Refresh button
         "add-account-form",  # Add account form
         "provider",  # provider select (4 provider kinds)
