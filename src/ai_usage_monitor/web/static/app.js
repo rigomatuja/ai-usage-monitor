@@ -23,10 +23,14 @@ const $ = (id) => document.getElementById(id);
 
 const els = {
   banner: $("connection-banner"),
-  groups: {
-    claude: { cards: $("cards-claude"), count: $("count-claude"), name: "Claude" },
-    openai: { cards: $("cards-openai"), count: $("count-openai"), name: "OpenAI" },
-  },
+  // One column per platform. A new platform needs a matching
+  // <section id="group-<platform>"> with #cards-<platform> and #count-<platform>.
+  groups: Object.fromEntries(["claude", "openai"].map((platform) => [platform, {
+    section: $(`group-${platform}`),
+    cards: $(`cards-${platform}`),
+    count: $(`count-${platform}`),
+  }])),
+  noAccounts: $("no-accounts"),
   refreshBtn: $("refresh-btn"),
   form: $("add-account-form"),
   provider: $("provider"),
@@ -241,9 +245,9 @@ function snapshotsByAccount() {
   return new Map(lastUsage.map((snap) => [snap.account_id, snap]));
 }
 
-// Claude/Anthropic accounts in one group, ChatGPT/OpenAI in the other.
+// Each account goes to its platform's column (Claude/Anthropic, ChatGPT/OpenAI).
 function groupFor(account) {
-  return account.platform === "claude" ? els.groups.claude : els.groups.openai;
+  return els.groups[account.platform] || els.groups.openai;
 }
 
 function renderAll() {
@@ -255,10 +259,9 @@ function renderAll() {
   for (const group of Object.values(els.groups)) {
     const count = group.cards.children.length;
     group.count.textContent = String(count);
-    if (!count) {
-      group.cards.append(el("div", "empty-state", `No ${group.name} accounts yet. Connect one below.`));
-    }
+    group.section.hidden = !count; // platforms with nothing connected take no column
   }
+  els.noAccounts.hidden = accounts.length > 0;
   renderHiddenAccounts();
 }
 
