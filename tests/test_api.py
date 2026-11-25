@@ -121,7 +121,7 @@ class TestAccountsEndpoints:
         with monkeypatch.context() as faults:
             faults.setattr(Path, "read_text", checked_read)
             faults.setattr(os, "replace", checked_replace)
-            result = client.delete(path)
+            result = client.delete(path, headers=DASHBOARD_HEADERS)
 
         assert labels.read_bytes() == labels_before
         warnings = [record for record in caplog.records if record.name == "ai_usage_monitor.registry"]
@@ -368,7 +368,7 @@ class TestAccountsEndpoints:
         path = f"/api/accounts/{body['id']}"
         rename = client.patch(path, json={"label": "Renamed"}, headers=DASHBOARD_HEADERS)
         assert rename.status_code == 200
-        response = client.delete(path)
+        response = client.delete(path, headers=DASHBOARD_HEADERS)
         assert (response.status_code, response.content) == (204, b"")
         assert all(a["id"] != body["id"] for a in client.get("/api/accounts").json())
         config = tmp_path / "config"
@@ -377,7 +377,7 @@ class TestAccountsEndpoints:
 
     def test_delete_auto_account_hides_it_and_restore_brings_it_back(self, client):
         client.post("/api/usage/refresh/auto-chatgpt-personal")
-        response = client.delete("/api/accounts/auto-chatgpt-personal")
+        response = client.delete("/api/accounts/auto-chatgpt-personal", headers=DASHBOARD_HEADERS)
         assert (response.status_code, response.content) == (204, b"")
         assert client.get("/api/accounts").json() == []
         assert client.get("/api/usage").json() == []
@@ -398,7 +398,7 @@ class TestAccountsEndpoints:
         {"Origin": "http://127.0.0.1:61524", "Sec-Fetch-Site": "cross-site"},
     ])
     def test_restore_requires_dashboard_origin(self, client, headers):
-        client.delete("/api/accounts/auto-chatgpt-personal")
+        client.delete("/api/accounts/auto-chatgpt-personal", headers=DASHBOARD_HEADERS)
         response = client.post("/api/accounts/auto-chatgpt-personal/restore", headers=headers)
         assert response.status_code == 403
         assert response.json() == {"detail": "Cross-origin account restore denied"}
@@ -412,12 +412,33 @@ class TestAccountsEndpoints:
         assert response.status_code == 404
         assert response.json() == {"detail": "unknown account"}
 
+    @pytest.mark.parametrize("headers", [
+        {}, {"Origin": "http://evil.example"},
+        {"Origin": "http://127.0.0.1:61524", "Sec-Fetch-Site": "cross-site"},
+    ])
+    @pytest.mark.parametrize("kind", ["auto", "manual"])
+    def test_delete_requires_dashboard_origin(self, client, tmp_path, headers, kind):
+        if kind == "auto":
+            account_id = "auto-chatgpt-personal"
+        else:
+            account_id = client.post("/api/accounts", json={
+                "provider": "anthropic_org", "credentials": {"api_key": "sk-test"},
+            }).json()["id"]
+        config = tmp_path / "config"
+        before = {f.name: f.read_bytes() for f in config.glob("*.json")}
+        response = client.delete(f"/api/accounts/{account_id}", headers=headers)
+        assert response.status_code == 403
+        assert response.json() == {"detail": "Cross-origin account removal denied"}
+        assert {f.name: f.read_bytes() for f in config.glob("*.json")} == before
+        assert account_id in [a["id"] for a in client.get("/api/accounts").json()]
+        assert client.get("/api/accounts/hidden").json() == []
+
     def test_delete_undetected_auto_account_returns_404(self, client):
-        response = client.delete("/api/accounts/auto-claude-personal")
+        response = client.delete("/api/accounts/auto-claude-personal", headers=DASHBOARD_HEADERS)
         assert response.status_code == 404
 
     def test_delete_unknown_account_returns_404(self, client):
-        response = client.delete("/api/accounts/nope")
+        response = client.delete("/api/accounts/nope", headers=DASHBOARD_HEADERS)
         assert response.status_code == 404
 
 
@@ -1192,7 +1213,7 @@ def test_recreated_account_does_not_inherit_orphaned_label(
         return replace(source, target)
 
     monkeypatch.setattr(os, "replace", deny_label_replace)
-    assert client.delete(f"/api/accounts/{old_id}").status_code == 204
+    assert client.delete(f"/api/accounts/{old_id}", headers=DASHBOARD_HEADERS).status_code == 204
     assert "Café privé" not in client.get("/api/accounts").text
 
     colliding_uuid = uuid.UUID(old_id.rsplit("-", 1)[1] + "0" * 24)
@@ -1239,7 +1260,7 @@ def test_add_does_not_reuse_orphan_id_if_labels_unreadable(
         return [row for row in rows if row["source"] == "manual"]
 
     with patch.object(Path, "read_text", read_fault):
-        assert client.delete(route).status_code == 204
+        assert client.delete(route, headers=DASHBOARD_HEADERS).status_code == 204
         assert manual(client.get("/api/accounts").json()) == []
         before_accounts = accounts.read_bytes()
         draw = uuid.uuid4
