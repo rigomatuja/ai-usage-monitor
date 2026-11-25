@@ -222,6 +222,10 @@ async def _require_restore_origin(request: Request) -> None:
     _require_dashboard_origin(request, denied_detail="Cross-origin account restore denied")
 
 
+async def _require_removal_origin(request: Request) -> None:
+    _require_dashboard_origin(request, denied_detail="Cross-origin account removal denied")
+
+
 def build_router(registry: AccountRegistry, poller: UsagePoller) -> APIRouter:
     router = APIRouter()
 
@@ -280,7 +284,12 @@ def build_router(registry: AccountRegistry, poller: UsagePoller) -> APIRouter:
         except InvalidAccountLabel as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    @router.delete("/api/accounts/{account_id}", status_code=status.HTTP_204_NO_CONTENT)
+    @router.delete(
+        "/api/accounts/{account_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+        dependencies=[Depends(_require_removal_origin)],
+        responses={403: {"description": "Requests must originate from the dashboard"}},
+    )
     async def remove_account(account_id: str) -> Response:
         try:
             registry.remove_account(account_id)

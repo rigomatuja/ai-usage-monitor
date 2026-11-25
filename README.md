@@ -103,8 +103,8 @@ find locally are listed.
 
 The dashboard uses `DELETE /api/accounts/{account_id}` to remove or hide an
 account, `GET /api/accounts/hidden` to list hidden local logins, and
-`POST /api/accounts/{account_id}/restore` to restore one. Restore requests
-must originate from the dashboard.
+`POST /api/accounts/{account_id}/restore` to restore one. Remove and restore
+requests must originate from the dashboard (other origins get `403`).
 
 ## Development
 
