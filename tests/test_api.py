@@ -433,6 +433,16 @@ class TestAccountsEndpoints:
         assert account_id in [a["id"] for a in client.get("/api/accounts").json()]
         assert client.get("/api/accounts/hidden").json() == []
 
+    @pytest.mark.parametrize("headers", [
+        [("Origin", "http://127.0.0.1:61524"), ("Origin", "http://127.0.0.1:61524")],
+        [("Origin", "null")],
+    ])
+    def test_delete_rejects_duplicate_or_null_origin(self, client, headers):
+        response = client.delete("/api/accounts/auto-chatgpt-personal", headers=headers)
+        assert response.status_code == 403
+        assert response.json() == {"detail": "Cross-origin account removal denied"}
+        assert client.get("/api/accounts/hidden").json() == []
+
     def test_delete_undetected_auto_account_returns_404(self, client):
         response = client.delete("/api/accounts/auto-claude-personal", headers=DASHBOARD_HEADERS)
         assert response.status_code == 404
