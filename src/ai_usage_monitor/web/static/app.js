@@ -156,6 +156,41 @@ function fillClassForPercent(pct) {
   return "green";
 }
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+const WEEKDAY_FMT = new Intl.DateTimeFormat("en-US", { weekday: "short" });
+
+// Weekly bars: 7 equal day segments over the real window (reset - 7d .. reset),
+// a marked last segment (the one ending at the reset), and a "now" line.
+function decorateWeeklyBar(bar, win) {
+  bar.classList.add("weekly");
+  for (let i = 1; i < 7; i++) {
+    const tick = el("div", "week-tick");
+    tick.style.left = `${(i / 7) * 100}%`;
+    bar.append(tick);
+  }
+  const resetMs = win.resets_at ? new Date(win.resets_at).getTime() : NaN;
+  if (Number.isNaN(resetMs)) return null;
+  const startMs = resetMs - 7 * DAY_MS;
+  const seg = el("div", "week-reset-seg");
+  seg.style.left = `${(6 / 7) * 100}%`;
+  seg.style.width = `${100 / 7}%`;
+  seg.title = "reset day";
+  bar.append(seg);
+  const nowMs = Date.now();
+  if (nowMs >= startMs && nowMs <= resetMs) {
+    const marker = el("div", "week-now");
+    marker.style.left = `${((nowMs - startMs) / (7 * DAY_MS)) * 100}%`;
+    marker.title = "now";
+    bar.append(marker);
+  }
+  const legend = el("div", "week-legend");
+  for (let i = 0; i < 7; i++) {
+    const day = WEEKDAY_FMT.format(new Date(startMs + i * DAY_MS));
+    legend.append(el("span", i === 6 ? "week-day is-reset" : "week-day", day));
+  }
+  return legend;
+}
+
 function renderWindow(win) {
   const reset = win.resets_at ? el("div", "window-reset", fmtResets(win.resets_at)) : null;
   if (win.used_percent === null || win.used_percent === undefined) {
@@ -177,7 +212,9 @@ function renderWindow(win) {
   const fill = el("div", `progress-fill ${fillClassForPercent(win.used_percent)}`);
   fill.style.width = `${pct}%`;
   bar.append(fill);
+  const legend = win.kind === "weekly" ? decorateWeeklyBar(bar, win) : null;
   box.append(head, bar);
+  if (legend) box.append(legend);
   if (win.detail) box.append(el("div", "window-detail", win.detail));
   if (reset) box.append(reset);
   return box;

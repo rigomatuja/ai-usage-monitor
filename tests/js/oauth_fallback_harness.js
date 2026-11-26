@@ -98,6 +98,10 @@ const snapshot = {
     { label: "Daily", used_percent: null, resets_at: "2026-11-19T12:30:00Z" },
     { label: "Previous", used_percent: 50, resets_at: "2026-11-19T12:00:00Z" },
     { label: "No active session", used_percent: 0, resets_at: null },
+    { kind: "weekly", label: "Weekly limit", used_percent: 30, resets_at: "2026-11-21T15:45:00Z" },
+    { kind: "weekly", label: "Weekly no reset", used_percent: 5, resets_at: null },
+    { kind: "weekly", label: "Weekly far", used_percent: 5, resets_at: "2026-11-30T12:00:00Z" },
+    { kind: "weekly", label: "Weekly past", used_percent: 5, resets_at: "2026-11-19T12:00:00Z" },
   ],
 };
 
@@ -324,6 +328,48 @@ function exerciseDates(scenario, card) {
     assert.match(windows[4].textContent, /No active session/);
     return;
   }
+  if (scenario === "weekly-ticks") {
+    const all = (node, cls) => {
+      const found = [];
+      const walk = (n) => {
+        for (const child of n.children) {
+          if (!(child instanceof Element)) continue;
+          if (child.className?.split(" ").includes(cls)) found.push(child);
+          walk(child);
+        }
+      };
+      walk(node);
+      return found;
+    };
+    for (let i = 0; i < 5; i++) {
+      for (const cls of ["week-tick", "week-legend", "week-reset-seg", "week-now"]) {
+        assert.equal(all(windows[i], cls).length, 0, `window ${i} has no ${cls}`);
+      }
+    }
+    const w = windows[5];
+    assert.equal(all(w, "week-tick").length, 6);
+    assert.deepEqual(all(w, "week-tick").map((t) => t.style.left),
+      [1, 2, 3, 4, 5, 6].map((i) => `${(i / 7) * 100}%`));
+    const labels = all(w, "week-legend")[0].children.filter((c) => c instanceof Element);
+    assert.deepEqual(labels.map((l) => l.textContent), ["Sat", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri"]);
+    assert.deepEqual(labels.map((l) => l.className.split(" ").includes("is-reset")),
+      [false, false, false, false, false, false, true]);
+    assert.equal(all(w, "week-reset-seg").length, 1);
+    const marker = all(w, "week-now");
+    assert.equal(marker.length, 1);
+    assert.equal(Number.parseFloat(marker[0].style.left).toFixed(2), "69.35");
+    const bare = windows[6];
+    assert.equal(all(bare, "week-tick").length, 6);
+    for (const cls of ["week-legend", "week-reset-seg", "week-now"]) {
+      assert.equal(all(bare, cls).length, 0, `no-reset window has no ${cls}`);
+    }
+    for (const i of [7, 8]) {
+      assert.equal(all(windows[i], "week-tick").length, 6);
+      assert.equal(all(windows[i], "week-legend").length, 1);
+      assert.equal(all(windows[i], "week-now").length, 0, `window ${i} now outside range`);
+    }
+    return;
+  }
   const resetText = (index) => windows[index].querySelector(".window-reset")?.textContent;
   assert.match(resetText(0), /^resets Sat 21 Nov, 16:45 (?:CET|GMT\+1) · in 2d 3h$/);
   assert.match(resetText(1), /^resets Thu 19 Nov, 15:30 (?:CET|GMT\+1) · in 2h 15m$/);
@@ -348,7 +394,7 @@ async function main() {
   const authorizeUrl = "https://example.invalid/authorize?state=claude";
   const old = account("old");
   const other = account("other", "chatgpt_personal");
-  const dates = ["dates", "no-reset", "error-date"].includes(scenario);
+  const dates = ["dates", "no-reset", "error-date", "weekly-ticks"].includes(scenario);
   const restoring = ["restore", "restore-error"].includes(scenario);
   const accounts = ["rename", "clear", "reset-default", "rename-error", "add-blank", "add-named",
     "remove", "remove-cancel", "remove-all", "hide-auto"].includes(scenario) || restoring;

@@ -20,7 +20,9 @@ token/cost usage, across multiple accounts per platform.
   reset times (weekday, date and time in your browser's time zone, plus a
   countdown), stale-data markers, and controls to add or remove accounts.
   Any account, including auto-detected ones, can be renamed from its card (**Rename**);
-  clearing the name restores the default. No internet
+  clearing the name restores the default. Weekly bars are split into 7 day
+  segments labelled with the weekday (browser time zone); the segment ending
+  at the reset is highlighted and a thin line marks the current moment. No internet
   dependencies; the UI is fully offline.
 
 ## Requirements
