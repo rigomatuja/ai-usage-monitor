@@ -31,7 +31,7 @@ def test_account_removal(scenario):
     run_harness(scenario)
 
 
-@pytest.mark.parametrize("scenario", ["dates", "no-reset", "error-date"])
+@pytest.mark.parametrize("scenario", ["dates", "no-reset", "error-date", "weekly-ticks"])
 def test_reset_dates(scenario):
     run_harness(scenario)
 
